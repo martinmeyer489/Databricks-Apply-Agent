@@ -51,15 +51,11 @@ resources:
         - environment_key: agent_env
           spec:
             environment_version: "2"
-            # Pin the heavy agent stack to exact versions so pip's resolver has
-            # a single candidate per package and does not backtrack into
-            # ResolutionTooDeep. databricks-langchain pulls databricks-ai-search
-            # transitively, so the vector search client is not listed here.
+            # build_agent() and MatchingAgent now depend only on mlflow and the
+            # databricks SDK (both in the serverless base). mlflow is pinned so
+            # log_model/registration behaviour is reproducible. No langchain: the
+            # agent calls the gold.* UC functions directly via the SQL warehouse.
             dependencies:
-              - databricks-langchain==0.20.0
-              - langchain==1.4.0
-              - langchain-core==1.6.2
-              - databricks-ai-bridge==0.21.0
               - mlflow==3.16.0
 
       tasks:
@@ -134,6 +130,7 @@ resources:
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               serving_endpoint_name: "{{job.parameters.matching_agent_endpoint_name}}"
+              warehouse_id: "{{job.parameters.warehouse_id}}"
           environment_key: agent_env
           timeout_seconds: 3600
           max_retries: 0

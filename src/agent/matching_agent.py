@@ -39,28 +39,120 @@ NO_MATCHES_SUGGESTION = (
 # --------------------------------------------------------------------------
 
 
-def build_agent():
-    """Construct the LangChain agent backing the Matching Agent.
+def build_agent(warehouse_id: Optional[str] = None):
+    """Build the tool callables backing the Matching Agent.
 
-    Wires up `ChatDatabricks` against the shared Foundation Model endpoint
-    and a `UCFunctionToolkit` exposing all 4 UC Function tools (Req 7.2),
-    and enables MLflow autologging so every invocation emits an
-    `MLflow_Trace` (Req 9.1).
+    The matching flow in :class:`MatchingAgent` drives retrieval by calling
+    three UC Function tools directly (``get_user_profile``,
+    ``search_listings``, ``compute_commute_distance``) rather than delegating
+    to a free-form LLM agent loop, so this function returns a plain dict of
+    callables wired to those Unity Catalog functions. Each callable executes
+    the corresponding ``job_agent.gold.*`` UC function on the serverless SQL
+    warehouse via the Databricks SDK statement execution API.
+
+    (Earlier revisions returned a LangChain ``AgentExecutor`` here, but it was
+    never invoked by the matching flow and its constructor API was removed in
+    LangChain 1.x; returning the tools dict directly both fixes that import
+    break and ensures the deployed model actually has working tools.)
+
+    Args:
+        warehouse_id: SQL warehouse used to execute the UC functions. If not
+            provided, falls back to the ``SQL_WAREHOUSE_ID`` / ``DATABRICKS_WAREHOUSE_ID``
+            environment variable.
 
     Returns:
-        An `AgentExecutor` ready to receive matching requests.
+        A dict with keys ``get_user_profile``, ``search_listings``, and
+        ``compute_commute_distance`` mapping to callables.
     """
+    import os
+
     import mlflow
-    from databricks_langchain import ChatDatabricks
-    from databricks_langchain.uc_ai import UCFunctionToolkit
-    from langchain.agents import AgentExecutor
+    from databricks.sdk import WorkspaceClient
 
     mlflow.langchain.autolog()
 
-    llm = ChatDatabricks(endpoint=LLM_ENDPOINT)
-    toolkit = UCFunctionToolkit(function_names=UC_FUNCTION_NAMES)
+    resolved_warehouse_id = (
+        warehouse_id
+        or os.environ.get("SQL_WAREHOUSE_ID")
+        or os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    )
 
-    return AgentExecutor(llm=llm, tools=toolkit.get_tools())
+    w = WorkspaceClient()
+
+    def _run(statement: str) -> list[list[Any]]:
+        result = w.statement_execution.execute_statement(
+            warehouse_id=resolved_warehouse_id,
+            statement=statement,
+            wait_timeout="50s",
+        )
+        if result.result and result.result.data_array:
+            return result.result.data_array
+        return []
+
+    def _sql_str(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def get_user_profile(profile_id: str) -> Dict[str, Any]:
+        rows = _run(
+            "SELECT * FROM "
+            f"job_agent.gold.get_user_profile({_sql_str(profile_id)})"
+        )
+        if not rows:
+            return {}
+        (
+            skills,
+            years_of_experience,
+            job_title_history,
+            qualifications_summary,
+            home_latitude,
+            home_longitude,
+            home_location_name,
+            commute_radius_km,
+        ) = rows[0]
+        return {
+            "skills": skills,
+            "years_of_experience": years_of_experience,
+            "job_title_history": job_title_history,
+            "qualifications_summary": qualifications_summary,
+            "home_latitude": float(home_latitude) if home_latitude is not None else None,
+            "home_longitude": float(home_longitude) if home_longitude is not None else None,
+            "home_location_name": home_location_name,
+            "commute_radius_km": int(commute_radius_km) if commute_radius_km is not None else None,
+        }
+
+    def search_listings(query_text: str, max_results: int = MAX_SEARCH_CANDIDATES) -> List[Dict[str, Any]]:
+        rows = _run(
+            "SELECT listing_id, job_title, company_name, latitude, longitude, "
+            "enrichment_state, similarity_score FROM "
+            f"job_agent.gold.search_listings({_sql_str(query_text)}, {int(max_results)})"
+        )
+        results = []
+        for r in rows:
+            results.append(
+                {
+                    "listing_id": r[0],
+                    "job_title": r[1],
+                    "company_name": r[2],
+                    "latitude": float(r[3]) if r[3] is not None else None,
+                    "longitude": float(r[4]) if r[4] is not None else None,
+                    "enrichment_state": r[5],
+                    "similarity_score": float(r[6]) if r[6] is not None else 0.0,
+                }
+            )
+        return results
+
+    def compute_commute_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        rows = _run(
+            "SELECT job_agent.gold.compute_commute_distance("
+            f"{float(lat1)}, {float(lon1)}, {float(lat2)}, {float(lon2)})"
+        )
+        return float(rows[0][0]) if rows and rows[0][0] is not None else float("inf")
+
+    return {
+        "get_user_profile": get_user_profile,
+        "search_listings": search_listings,
+        "compute_commute_distance": compute_commute_distance,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -309,3 +401,67 @@ class MatchingAgent:
                 raise TimeoutError(
                     f"Matching timed out after {MATCHING_TIMEOUT_SECONDS}s"
                 ) from exc
+
+
+# --------------------------------------------------------------------------
+# MLflow pyfunc adapter (Req 7.1, 9.1)
+# --------------------------------------------------------------------------
+
+
+def _extract_profile_id(model_input: Any) -> Optional[str]:
+    """Pull `profile_id` out of the various shapes MLflow may hand `predict`.
+
+    Model Serving / ``mlflow.pyfunc`` can deliver the input as a dict, a list
+    of dicts (batch), or a pandas DataFrame with a ``profile_id`` column.
+    """
+    # pandas DataFrame (has a to_dict method)
+    if hasattr(model_input, "to_dict") and not isinstance(model_input, dict):
+        try:
+            records = model_input.to_dict("records")
+            if records:
+                return records[0].get("profile_id")
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(model_input, dict):
+        return model_input.get("profile_id")
+    if isinstance(model_input, list) and model_input:
+        first = model_input[0]
+        if isinstance(first, dict):
+            return first.get("profile_id")
+    return None
+
+
+class MatchingAgentModel:
+    """`mlflow.pyfunc.PythonModel` adapter around :class:`MatchingAgent`.
+
+    Subclassing is done lazily via ``__init_subclass__``-free indirection so
+    this module still imports cleanly outside a Databricks/mlflow runtime
+    (the unit tests import :class:`MatchingAgent` only). In production,
+    ``make_pyfunc_model()`` returns an instance whose class actually derives
+    from ``mlflow.pyfunc.PythonModel``.
+    """
+
+    def load_context(self, context):  # noqa: D401 - mlflow hook
+        # Tools are constructed at serving time so the served model calls the
+        # gold.* UC functions via the SQL warehouse (resolved from the
+        # SQL_WAREHOUSE_ID env var configured on the serving endpoint).
+        self._agent = MatchingAgent(tools=build_agent())
+
+    def predict(self, context, model_input, params=None):  # noqa: D401 - mlflow hook
+        if not hasattr(self, "_agent") or self._agent is None:
+            self._agent = MatchingAgent(tools=build_agent())
+        profile_id = _extract_profile_id(model_input)
+        return self._agent.predict({"profile_id": profile_id})
+
+
+def make_pyfunc_model():
+    """Return an ``mlflow.pyfunc.PythonModel`` instance wrapping the agent.
+
+    Resolved lazily so importing this module does not require mlflow.
+    """
+    import mlflow
+
+    class _MatchingAgentPyfunc(mlflow.pyfunc.PythonModel, MatchingAgentModel):
+        pass
+
+    return _MatchingAgentPyfunc()

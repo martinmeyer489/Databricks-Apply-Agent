@@ -46,6 +46,7 @@ from src.agent.matching_agent import (  # noqa: E402
     UC_FUNCTION_NAMES,
     MatchingAgent,
     build_agent,
+    make_pyfunc_model,
 )
 
 # COMMAND ----------
@@ -59,16 +60,19 @@ dbutils.widgets.text("catalog", "job_agent", "Catalog name")
 dbutils.widgets.text("registered_model_name", "gold.matching_agent", "UC registered model name (schema.model, catalog prepended)")
 dbutils.widgets.text("serving_endpoint_name", "job-agent-matching", "Model Serving endpoint name")
 dbutils.widgets.text("serving_endpoint_workload_size", "Small", "Model Serving endpoint workload size")
+dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID the agent tools use to call the gold.* UC functions")
 
 CATALOG = dbutils.widgets.get("catalog")
 REGISTERED_MODEL_NAME = f"{CATALOG}.{dbutils.widgets.get('registered_model_name')}"
 SERVING_ENDPOINT_NAME = dbutils.widgets.get("serving_endpoint_name")
 SERVING_ENDPOINT_WORKLOAD_SIZE = dbutils.widgets.get("serving_endpoint_workload_size")
+WAREHOUSE_ID = dbutils.widgets.get("warehouse_id").strip()
 
 print(f"Catalog:                  {CATALOG}")
 print(f"Registered model name:    {REGISTERED_MODEL_NAME}")
 print(f"Serving endpoint name:    {SERVING_ENDPOINT_NAME}")
 print(f"Serving endpoint size:    {SERVING_ENDPOINT_WORKLOAD_SIZE}")
+print(f"Warehouse ID:             {WAREHOUSE_ID}")
 
 # COMMAND ----------
 
@@ -95,21 +99,28 @@ from mlflow.models.resources import DatabricksFunction, DatabricksServingEndpoin
 
 mlflow.set_registry_uri("databricks-uc")
 
-# The real UC Function tool wiring happens inside build_agent() (which
-# constructs a UCFunctionToolkit against UC_FUNCTION_NAMES); MatchingAgent
-# itself takes an already-wired `agent` executor so the logged pyfunc model
-# is a thin ResponsesAgent wrapper around it.
-agent_executor = build_agent()
-matching_agent = MatchingAgent(agent=agent_executor)
+# The UC Function tool wiring happens inside build_agent(), which returns a
+# dict of callables (get_user_profile, search_listings,
+# compute_commute_distance) that execute the job_agent.gold.* UC functions on
+# the SQL warehouse. The pyfunc adapter (make_pyfunc_model) constructs those
+# tools at serving time and delegates matching to MatchingAgent.
+pyfunc_model = make_pyfunc_model()
 
 resources = [DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT)] + [
     DatabricksFunction(function_name=fn) for fn in UC_FUNCTION_NAMES
 ]
 
+# Ship the src/ package with the model so `from src.agent.matching_agent
+# import ...` resolves at serving time, and give MLflow a concrete
+# input/output example to infer the signature.
+input_example = {"profile_id": "example-profile-id"}
+
 with mlflow.start_run(run_name="matching_agent_registration") as run:
     logged_model_info = mlflow.pyfunc.log_model(
         artifact_path="matching_agent",
-        python_model=matching_agent,
+        python_model=pyfunc_model,
+        code_paths=[os.path.join(_REPO_ROOT, "src")],
+        input_example=input_example,
         resources=resources,
         registered_model_name=REGISTERED_MODEL_NAME,
     )

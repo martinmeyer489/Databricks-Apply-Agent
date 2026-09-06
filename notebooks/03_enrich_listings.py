@@ -276,6 +276,13 @@ def extract_attributes_via_ai_query(batch: list[dict]) -> dict[str, dict]:
 def _query_llm_endpoint(job_description: str) -> str:
     """Call Foundation Model APIs for a single listing's job description.
 
+    Uses the OpenAI-compatible client exposed by the Databricks SDK
+    (`serving_endpoints.get_open_ai_client()`), which accepts plain-dict
+    chat messages and returns a standard OpenAI response object. This avoids
+    the SDK's native `serving_endpoints.query(messages=[{...}])` path, which
+    on recent SDK versions raises ``'dict' object has no attribute 'as_dict'``
+    when handed plain-dict messages.
+
     Wrapped in `retry_with_backoff` so a rate-limited (HTTP 429) response
     is retried up to 3 times with exponential backoff starting at 2
     seconds (Req 11 AC10).
@@ -283,8 +290,9 @@ def _query_llm_endpoint(job_description: str) -> str:
     from databricks.sdk import WorkspaceClient
 
     client = WorkspaceClient()
-    response = client.serving_endpoints.query(
-        name=LLM_ENDPOINT,
+    openai_client = client.serving_endpoints.get_open_ai_client()
+    response = openai_client.chat.completions.create(
+        model=LLM_ENDPOINT,
         messages=[
             {
                 "role": "user",
