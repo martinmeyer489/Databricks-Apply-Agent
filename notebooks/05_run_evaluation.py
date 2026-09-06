@@ -244,7 +244,11 @@ cover_letters = []
 for _, case in eval_cases_pdf.iterrows():
     profile = case["user_profile_dict"]
     expected_ids = case["expected_listing_ids"]
-    target_listing_id = expected_ids[0] if expected_ids else None
+    # expected_ids may be a numpy array (from pandas), so avoid `if expected_ids`
+    # which raises "truth value of an array ... is ambiguous"; check length.
+    target_listing_id = (
+        expected_ids[0] if expected_ids is not None and len(expected_ids) > 0 else None
+    )
     if target_listing_id is None:
         cover_letters.append("")
         continue
@@ -259,7 +263,7 @@ for _, case in eval_cases_pdf.iterrows():
 
 eval_cases_pdf["cover_letter"] = cover_letters
 eval_cases_pdf["target_listing_id"] = eval_cases_pdf["expected_listing_ids"].apply(
-    lambda ids: ids[0] if ids else None
+    lambda ids: ids[0] if ids is not None and len(ids) > 0 else None
 )
 
 print(f"Drafted {sum(1 for c in cover_letters if c)} of {len(cover_letters)} reference cover letters")
@@ -328,12 +332,18 @@ match_relevance_scorer = make_genai_metric(
             output="Returned: Senior Data Engineer (Spark, Delta Lake); Data Platform Engineer (Python, SQL)",
             score=5,
             justification="Both returned matches directly align with the profile's skills and title history.",
+            grading_context={
+                "user_profile_json": '{"skills": ["Python", "Spark", "SQL"], "job_title_history": ["Data Engineer"]}'
+            },
         ),
         EvaluationExample(
             input="Profile: skills=[Python, Spark, SQL], titles=[Data Engineer]",
             output="Returned: Retail Store Manager; Graphic Designer",
             score=1,
             justification="Neither returned match relates to the profile's data engineering background.",
+            grading_context={
+                "user_profile_json": '{"skills": ["Python", "Spark", "SQL"], "job_title_history": ["Data Engineer"]}'
+            },
         ),
     ],
     version="v1",
@@ -370,12 +380,23 @@ groundedness_scorer = make_genai_metric(
             ),
             score=5,
             justification="Every claim in the letter maps directly to a skill in the profile and the listing.",
+            grading_context={
+                "user_profile_json": '{"skills": ["Python", "Spark"]}',
+                "cover_letter": (
+                    "I have hands-on experience with Python and Apache Spark, which "
+                    "directly matches the Senior Data Engineer role's requirements."
+                ),
+            },
         ),
         EvaluationExample(
             input="Profile: skills=[Python, Spark]; Listing: Senior Data Engineer requiring Python, Spark",
             output="I am an expert in nuclear physics and have led international diplomacy initiatives.",
             score=1,
             justification="None of the claims are supported by the profile or the listing.",
+            grading_context={
+                "user_profile_json": '{"skills": ["Python", "Spark"]}',
+                "cover_letter": "I am an expert in nuclear physics and have led international diplomacy initiatives.",
+            },
         ),
     ],
     version="v1",

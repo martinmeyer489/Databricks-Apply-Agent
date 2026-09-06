@@ -15,6 +15,14 @@ resources:
           default: ${var.catalog}
         - name: warehouse_id
           default: ${var.sql_warehouse_id}
+        - name: model_version
+          default: "1"
+      environments:
+        - environment_key: eval_env
+          spec:
+            environment_version: "2"
+            dependencies:
+              - mlflow==3.16.0
       tasks:
         - task_key: seed_evaluation_dataset
           notebook_task:
@@ -32,5 +40,7 @@ resources:
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              model_version: "{{job.parameters.model_version}}"
+          environment_key: eval_env
           timeout_seconds: 3600
           max_retries: 0
