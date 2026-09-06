@@ -216,6 +216,10 @@ else:
             entity_version=str(model_version),
             workload_size=SERVING_ENDPOINT_WORKLOAD_SIZE,
             scale_to_zero_enabled=True,
+            # The agent's tool callables (build_agent) execute the gold.* UC
+            # functions on this SQL warehouse via the SDK; the served model
+            # reads the warehouse id from this env var at inference time.
+            environment_vars={"SQL_WAREHOUSE_ID": WAREHOUSE_ID} if WAREHOUSE_ID else None,
         )
     ]
 
