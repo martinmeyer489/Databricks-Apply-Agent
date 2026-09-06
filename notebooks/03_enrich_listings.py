@@ -165,30 +165,68 @@ print(f"Unenriched listings to process: {len(joined_records)}")
 # COMMAND ----------
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 LLM_EXTRACTION_PROMPT_TEMPLATE = (
-    "Extract from this job description as JSON with keys: required_skills "
-    "(array), seniority_level, employment_type, industry, company_size_band. "
-    "Description: {job_description}"
+    "Extract structured attributes from the job description below. "
+    "Respond with ONLY a single JSON object and nothing else — no markdown "
+    "code fences, no explanation. The object must have exactly these keys: "
+    "required_skills (array of strings), seniority_level (string), "
+    "employment_type (string), industry (string), company_size_band (string). "
+    "Job description: {job_description}"
 )
 
 
 def _parse_llm_json(raw_response: str) -> dict:
-    """Parse a raw LLM JSON response string into an llm_result dict.
+    """Parse a raw LLM response string into an llm_result dict.
 
-    Returns a hard-failure marker dict (see `enrichment_state` module
-    docstring) if the response is empty or is not valid JSON.
+    Chat models such as ``databricks-meta-llama-3-3-70b-instruct`` frequently
+    wrap their JSON in markdown fences (```json ... ```) or surround it with
+    explanatory prose, so a bare ``json.loads`` on the whole response fails
+    with "Expecting value: line 1 column 1 (char 0)" and every record ends up
+    ``failed``. This parser is tolerant:
+
+    1. Strip a leading/trailing markdown code fence if present.
+    2. Try ``json.loads`` on the cleaned text.
+    3. Fall back to extracting the first balanced ``{...}`` object substring
+       and parsing that.
+
+    Returns a hard-failure marker dict (see ``enrichment_state`` module
+    docstring) if no JSON object can be recovered.
     """
     if not raw_response:
         return {"error": "empty LLM response"}
-    try:
-        parsed = json.loads(raw_response)
-        if not isinstance(parsed, dict):
-            return {"error": f"LLM response was not a JSON object: {raw_response!r}"}
+
+    text = raw_response.strip()
+
+    # 1. Strip markdown code fences: ```json\n{...}\n``` or ```\n{...}\n```
+    if text.startswith("```"):
+        # drop the opening fence line (``` or ```json) and any closing fence
+        text = re.sub(r"^```[a-zA-Z0-9_]*\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    def _try(candidate: str):
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    # 2. Direct parse of the (de-fenced) text.
+    parsed = _try(text)
+    if parsed is not None:
         return parsed
-    except (TypeError, ValueError) as exc:
-        return {"error": f"invalid JSON response: {exc}"}
+
+    # 3. Extract the first {...} object substring and parse that. Handles the
+    #    common "Here is the JSON: { ... }" prose-wrapped case.
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        parsed = _try(match.group(0))
+        if parsed is not None:
+            return parsed
+
+    return {"error": f"invalid JSON response: {raw_response!r}"}
 
 
 def extract_attributes_via_ai_query(batch: list[dict]) -> dict[str, dict]:
@@ -210,9 +248,13 @@ def extract_attributes_via_ai_query(batch: list[dict]) -> dict[str, dict]:
                ai_query(
                  '{LLM_ENDPOINT}',
                  CONCAT(
-                   'Extract from this job description as JSON with keys: '
-                   'required_skills (array), seniority_level, employment_type, '
-                   'industry, company_size_band. Description: ',
+                   'Extract structured attributes from the job description below. ',
+                   'Respond with ONLY a single JSON object and nothing else - no ',
+                   'markdown code fences, no explanation. The object must have ',
+                   'exactly these keys: required_skills (array of strings), ',
+                   'seniority_level (string), employment_type (string), ',
+                   'industry (string), company_size_band (string). ',
+                   'Job description: ',
                    job_description
                  )
                ) AS llm_response

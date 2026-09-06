@@ -51,9 +51,16 @@ resources:
         - environment_key: agent_env
           spec:
             environment_version: "2"
+            # Pin the heavy agent stack to exact versions so pip's resolver has
+            # a single candidate per package and does not backtrack into
+            # ResolutionTooDeep. databricks-langchain pulls databricks-ai-search
+            # transitively, so the vector search client is not listed here.
             dependencies:
-              - databricks-vectorsearch==0.75
               - databricks-langchain==0.20.0
+              - langchain==1.4.0
+              - langchain-core==1.6.2
+              - databricks-ai-bridge==0.21.0
+              - mlflow==3.16.0
 
       tasks:
         - task_key: setup_catalog
