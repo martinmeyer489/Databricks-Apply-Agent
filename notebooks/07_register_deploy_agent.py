@@ -97,7 +97,7 @@ print(f"Warehouse ID:             {WAREHOUSE_ID}")
 # COMMAND ----------
 
 import mlflow
-from mlflow.models.resources import DatabricksFunction, DatabricksServingEndpoint
+from mlflow.models.resources import DatabricksFunction, DatabricksServingEndpoint, DatabricksSQLWarehouse
 
 mlflow.set_registry_uri("databricks-uc")
 
@@ -111,6 +111,11 @@ pyfunc_model = make_pyfunc_model()
 resources = [DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT)] + [
     DatabricksFunction(function_name=fn) for fn in UC_FUNCTION_NAMES
 ]
+# Declare the SQL warehouse the agent's tool callables use so Model Serving
+# provisions credentials for it at inference time (otherwise the served
+# model's statement_execution calls have no warehouse auth and predict fails).
+if WAREHOUSE_ID:
+    resources.append(DatabricksSQLWarehouse(warehouse_id=WAREHOUSE_ID))
 
 # Ship the src/ package with the model so `from src.agent.matching_agent
 # import ...` resolves at serving time, and give MLflow a concrete
