@@ -30,7 +30,7 @@ if _REPO_ROOT not in sys.path:
 import gradio as gr
 
 from src.agent.cv_parser import parse_cv
-from src.agent.location_resolver import resolve_location
+from src.agent.location_resolver import resolve_location, resolve_location_via_warehouse
 from src.agent.matching_agent import validate_profile_completeness
 from src.utils.input_validation import (
     validate_commute_radius,
@@ -294,15 +294,20 @@ def handle_location_resolve(
         gr.Warning(radius_message)
         return user_profile, ""
 
-    spark = _get_spark_session()
-    if spark is None:
-        gr.Warning(
-            "Location resolution requires a Databricks connection. "
-            "Please run this app as a Databricks App or configure Databricks Connect."
-        )
-        return user_profile, ""
-
-    resolved = resolve_location(spark, location_text)
+    # Resolve via the SQL warehouse using the Databricks SDK, which works
+    # inside a Databricks App container (no ambient Spark session). Only fall
+    # back to the Spark/Databricks Connect path if the SDK path is unavailable.
+    try:
+        resolved = resolve_location_via_warehouse(location_text)
+    except Exception:  # noqa: BLE001 - fall back to a Spark session if present
+        spark = _get_spark_session()
+        if spark is None:
+            gr.Warning(
+                "Location resolution requires a Databricks connection. "
+                "Please run this app as a Databricks App or configure Databricks Connect."
+            )
+            return user_profile, ""
+        resolved = resolve_location(spark, location_text)
     if resolved is None:
         gr.Warning(
             "We couldn't resolve that location. Please enter a valid city name or postal code."
@@ -451,19 +456,22 @@ def _invoke_matching_agent(
     Tabs 1-2.
     """
     try:
+        import json as _json
+
         from databricks.sdk import WorkspaceClient
 
         client = WorkspaceClient()
         response = client.serving_endpoints.query(
             name=MATCHING_AGENT_ENDPOINT_NAME,
-            inputs={"profile_id": user_profile.get("profile_id")},
+            dataframe_records=[{"profile_id": user_profile.get("profile_id")}],
         )
-        # `query()` returns an SDK response object; the agent's response
-        # payload is expected under `.predictions` or similar depending on
-        # the endpoint's signature. Normalize to a plain dict here.
-        if isinstance(response, dict):
-            return response, None
-        return dict(getattr(response, "predictions", response)), None
+        # The agent returns a JSON string prediction; normalize to a dict.
+        preds = getattr(response, "predictions", response)
+        if isinstance(preds, list) and preds:
+            preds = preds[0]
+        if isinstance(preds, str):
+            preds = _json.loads(preds)
+        return (preds if isinstance(preds, dict) else {"results": []}), None
     except Exception as exc:  # noqa: BLE001 - classified by the caller
         return None, exc
 

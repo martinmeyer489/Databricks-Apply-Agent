@@ -179,22 +179,23 @@ def test_ingestion_mode_selection(api_reachable, expected_mode):
 
 
 def test_fetch_jobs_from_api_returns_records(notebook_funcs):
-    """API fetch returns properly formatted job records."""
+    """API fetch returns properly formatted job records (v6 schema)."""
     search_response = _FakeResponse(200, {
-        "stellenangebote": [
+        "ergebnisliste": [
             {
-                "refnr": "10001-123456789-S",
-                "beruf": "Data Engineer",
-                "arbeitgeber": "Test Company",
-                "arbeitsort": {"plz": "10115", "ort": "Berlin", "region": "Berlin"},
+                "referenznummer": "10001-123456789-S",
+                "stellenangebotsTitel": "Senior Data Engineer",
+                "firma": "Test Company",
+                "stellenlokationen": [
+                    {"adresse": {"plz": "10115", "ort": "Berlin", "region": "Berlin"}}
+                ],
             }
         ]
     })
     detail_response = _FakeResponse(200, {
         "stellenangebotsTitel": "Senior Data Engineer",
-        "arbeitgeber": "Test Company",
+        "firma": "Test Company",
         "stellenangebotsBeschreibung": "We are hiring!",
-        "arbeitsorte": [{"plz": "10115", "ort": "Berlin", "region": "Berlin"}],
     })
 
     call_count = [0]
@@ -223,7 +224,7 @@ def test_fetch_jobs_from_api_returns_records(notebook_funcs):
 
 def test_fetch_jobs_from_api_handles_empty_results(notebook_funcs):
     """API fetch handles empty search results gracefully."""
-    empty_response = _FakeResponse(200, {"stellenangebote": []})
+    empty_response = _FakeResponse(200, {"ergebnisliste": []})
 
     with patch("requests.get", return_value=empty_response), patch("time.sleep"):
         records = notebook_funcs["fetch_jobs_from_api"](

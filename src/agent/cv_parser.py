@@ -83,6 +83,11 @@ def _extract_text(file_path: str, file_format: str) -> str:
 def _query_llm_endpoint(cv_text: str) -> str:
     """Call Foundation Model APIs with the structured extraction prompt.
 
+    Uses the OpenAI-compatible client (`serving_endpoints.get_open_ai_client()`)
+    which accepts plain-dict messages and returns a standard response object;
+    the SDK's native `serving_endpoints.query(messages=[{...}])` path raises
+    ``'dict' object has no attribute 'as_dict'`` on recent SDK versions.
+
     Wrapped in `retry_with_backoff` so a rate-limited (HTTP 429) response
     is retried up to 3 times with exponential backoff starting at 2
     seconds (Req 11 AC10).
@@ -90,8 +95,9 @@ def _query_llm_endpoint(cv_text: str) -> str:
     from databricks.sdk import WorkspaceClient
 
     client = WorkspaceClient()
-    response = client.serving_endpoints.query(
-        name=LLM_ENDPOINT,
+    openai_client = client.serving_endpoints.get_open_ai_client()
+    response = openai_client.chat.completions.create(
+        model=LLM_ENDPOINT,
         messages=[
             {
                 "role": "user",
@@ -124,18 +130,39 @@ def _call_llm_with_timeout(cv_text: str, timeout_seconds: int = CV_PARSING_TIMEO
 def _parse_llm_json(raw_response: str) -> Dict[str, Any]:
     """Parse the LLM's raw response string into a dict of extracted fields.
 
-    Raises `RuntimeError` (descriptive) if the response is empty or is not
-    a valid JSON object, since that indicates the LLM call itself
-    succeeded but produced unusable output (Req 5.7).
+    Tolerant of the markdown-fenced (```json ... ```) and prose-wrapped
+    outputs that chat models commonly emit: strips a code fence if present,
+    then falls back to extracting the first ``{...}`` object. Raises a
+    descriptive `RuntimeError` only if no JSON object can be recovered
+    (Req 5.7).
     """
     if not raw_response:
         raise RuntimeError("CV parsing failed: empty response from Foundation Model APIs")
-    try:
-        parsed = json.loads(raw_response)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"CV parsing failed: invalid JSON response ({exc})") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("CV parsing failed: LLM response was not a JSON object")
+
+    import re
+
+    text = raw_response.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_]*\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    def _try(candidate: str):
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = _try(text)
+    if parsed is None:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            parsed = _try(match.group(0))
+
+    if parsed is None:
+        raise RuntimeError(
+            f"CV parsing failed: invalid JSON response ({raw_response!r:.200})"
+        )
     return parsed
 
 

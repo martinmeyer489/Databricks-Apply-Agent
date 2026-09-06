@@ -299,23 +299,53 @@ def fetch_jobs_from_api(
                 print(f"  Page {page}: ERROR: {exc}")
                 break
 
-            # Extract job refs from search response
-            stellenangebote = search_data.get("stellenangebote", [])
-            if not stellenangebote:
+            # The v6 search endpoint returns matches under `ergebnisliste`
+            # (older code looked for `stellenangebote`, which no longer exists,
+            # so every search read 0 results and fell back to bundled data).
+            ergebnisliste = search_data.get("ergebnisliste", [])
+            if not ergebnisliste:
                 print(f"  Page {page}: No more results")
                 break
 
-            print(f"  Page {page}: Found {len(stellenangebote)} job(s)")
+            print(f"  Page {page}: Found {len(ergebnisliste)} job(s)")
 
-            for job in stellenangebote:
-                refnr = job.get("refnr")
+            for job in ergebnisliste:
+                # v6 uses `referenznummer` (was `refnr`).
+                refnr = job.get("referenznummer") or job.get("refnr")
                 if not refnr or refnr in seen_refnrs:
                     continue
                 seen_refnrs.add(refnr)
 
-                # Fetch full job details
+                # Most fields are available directly on the search result.
+                job_title = job.get("stellenangebotsTitel") or (
+                    (job.get("alleBerufe") or [""])[0]
+                )
+                company_name = job.get("firma") or ""
+
+                # Location from stellenlokationen[0].adresse (v6). Also capture
+                # coordinates (breite/laenge) when present.
+                location_text = query_params.get("wo", "Deutschland")
+                lokationen = job.get("stellenlokationen") or []
+                if lokationen:
+                    adresse = (lokationen[0] or {}).get("adresse") or {}
+                    parts = [
+                        str(adresse.get("plz")) if adresse.get("plz") else None,
+                        adresse.get("ort"),
+                        adresse.get("region"),
+                    ]
+                    parts = [p for p in parts if p]
+                    if parts:
+                        location_text = ", ".join(parts)
+
+                # The description is only on the detail endpoint. Fetch it, but
+                # a detail failure is non-fatal — keep the listing with an empty
+                # description rather than dropping it.
+                job_description = ""
                 try:
-                    detail_url = f"https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobdetails/{base64.b64encode(refnr.encode()).decode()}"
+                    detail_url = (
+                        "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/"
+                        f"pc/v4/jobdetails/{base64.b64encode(refnr.encode()).decode()}"
+                    )
                     detail_response = requests.get(
                         detail_url,
                         headers=JOBSUCHE_HEADERS,
@@ -323,34 +353,17 @@ def fetch_jobs_from_api(
                     )
                     detail_response.raise_for_status()
                     detail_data = detail_response.json()
-                except Exception as exc:
+                    job_description = (
+                        detail_data.get("stellenangebotsBeschreibung")
+                        or detail_data.get("stellenbeschreibung")
+                        or ""
+                    )
+                except Exception as exc:  # noqa: BLE001 - non-fatal
                     api_errors.append({
                         "source_domain": "arbeitsagentur.de",
                         "error_message": f"Details API failed for refnr {refnr}: {exc}",
                         "error_type": "api_error",
                     })
-                    print(f"    Refnr {refnr}: ERROR fetching details, skipping")
-                    continue
-
-                # Extract fields from detail response
-                job_title = detail_data.get("stellenangebotsTitel") or detail_data.get("titel", "")
-                company_name = detail_data.get("arbeitgeber", "")
-                job_description = detail_data.get("stellenangebotsBeschreibung") or detail_data.get("stellenbeschreibung", "")
-
-                # Extract location from arbeitsorte (can be multiple)
-                arbeitsorte = detail_data.get("arbeitsorte", [])
-                if arbeitsorte:
-                    primary_loc = arbeitsorte[0]
-                    location_parts = []
-                    if primary_loc.get("plz"):
-                        location_parts.append(str(primary_loc["plz"]))
-                    if primary_loc.get("ort"):
-                        location_parts.append(primary_loc["ort"])
-                    if primary_loc.get("region"):
-                        location_parts.append(primary_loc["region"])
-                    location_text = ", ".join(location_parts) if location_parts else query_params.get("wo", "Deutschland")
-                else:
-                    location_text = query_params.get("wo", "Deutschland")
 
                 # Build a stable source URL (the BA job portal URL)
                 source_url = f"https://www.arbeitsagentur.de/jobsuche/jobdetails/{refnr}"

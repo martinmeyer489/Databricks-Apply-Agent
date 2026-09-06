@@ -66,10 +66,19 @@ def build_agent(warehouse_id: Optional[str] = None):
     """
     import os
 
-    import mlflow
     from databricks.sdk import WorkspaceClient
 
-    mlflow.langchain.autolog()
+    # Enable MLflow tracing for observability, but never let it break the
+    # agent: mlflow.langchain.autolog() requires langchain, which is NOT in
+    # the model-serving environment (the agent calls UC functions directly,
+    # not via langchain). A failure here previously raised inside the serving
+    # container and surfaced as `{"predictions": null}`.
+    try:
+        import mlflow
+
+        mlflow.langchain.autolog()
+    except Exception:  # noqa: BLE001 - autolog is best-effort observability
+        pass
 
     resolved_warehouse_id = (
         warehouse_id
