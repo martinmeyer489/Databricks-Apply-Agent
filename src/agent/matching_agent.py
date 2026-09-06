@@ -459,10 +459,16 @@ class MatchingAgentModel:
         self._agent = MatchingAgent(tools=build_agent())
 
     def predict(self, context, model_input, params=None):  # noqa: D401 - mlflow hook
+        import json as _json
+
         if not hasattr(self, "_agent") or self._agent is None:
             self._agent = MatchingAgent(tools=build_agent())
         profile_id = _extract_profile_id(model_input)
-        return self._agent.predict({"profile_id": profile_id})
+        result = self._agent.predict({"profile_id": profile_id})
+        # Return a JSON string rather than a raw dict: mlflow pyfunc serving
+        # coerces un-signatured dict outputs to null, whereas a string output
+        # round-trips reliably through the serving JSON envelope.
+        return _json.dumps(result)
 
 
 def make_pyfunc_model():
