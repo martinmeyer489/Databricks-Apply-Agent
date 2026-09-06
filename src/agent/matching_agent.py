@@ -233,9 +233,20 @@ def filter_by_commute_radius(
     """
     kept = []
     for candidate in candidates:
-        distance_km = distance_fn(
-            home_lat, home_lon, candidate["latitude"], candidate["longitude"]
-        )
+        cand_lat = candidate.get("latitude")
+        cand_lon = candidate.get("longitude")
+        # Listings whose location could not be geocoded (null coordinates)
+        # cannot have a commute distance computed. Rather than silently
+        # dropping them (which would hide otherwise-relevant matches when the
+        # geocode lookup is incomplete), keep them with distance_km=None so
+        # the ranking still surfaces them; a known in-radius distance is
+        # attached when coordinates are available.
+        if cand_lat is None or cand_lon is None:
+            enriched = dict(candidate)
+            enriched["distance_km"] = None
+            kept.append(enriched)
+            continue
+        distance_km = distance_fn(home_lat, home_lon, cand_lat, cand_lon)
         if distance_km <= radius_km:
             enriched = dict(candidate)
             enriched["distance_km"] = round(distance_km, 1)
