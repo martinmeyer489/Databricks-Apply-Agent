@@ -118,9 +118,18 @@ if WAREHOUSE_ID:
     resources.append(DatabricksSQLWarehouse(warehouse_id=WAREHOUSE_ID))
 
 # Ship the src/ package with the model so `from src.agent.matching_agent
-# import ...` resolves at serving time, and give MLflow a concrete
-# input/output example to infer the signature.
+# import ...` resolves at serving time, and provide an explicit signature.
+# The pyfunc returns a JSON string, so the output schema is a single string
+# column — declared explicitly so Model Serving returns the string instead of
+# coercing an un-signatured/ mismatched output to null.
+from mlflow.models.signature import ModelSignature
+from mlflow.types.schema import ColSpec, Schema
+
 input_example = {"profile_id": "example-profile-id"}
+signature = ModelSignature(
+    inputs=Schema([ColSpec("string", "profile_id")]),
+    outputs=Schema([ColSpec("string")]),
+)
 
 with mlflow.start_run(run_name="matching_agent_registration") as run:
     logged_model_info = mlflow.pyfunc.log_model(
@@ -128,6 +137,7 @@ with mlflow.start_run(run_name="matching_agent_registration") as run:
         python_model=pyfunc_model,
         code_paths=[os.path.join(_REPO_ROOT, "src")],
         input_example=input_example,
+        signature=signature,
         resources=resources,
         registered_model_name=REGISTERED_MODEL_NAME,
     )
