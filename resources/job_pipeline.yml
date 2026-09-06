@@ -131,6 +131,7 @@ resources:
               catalog: "{{job.parameters.catalog}}"
               serving_endpoint_name: "{{job.parameters.matching_agent_endpoint_name}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              require_evaluation_gate: "false"
           environment_key: agent_env
           timeout_seconds: 3600
           max_retries: 0

@@ -15,8 +15,17 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+# The app is started as `python src/app/main.py`, which puts `src/app` (not the
+# repo root) on sys.path[0], so `import src...` fails with ModuleNotFoundError.
+# Add the repo root (three levels up from this file) to sys.path so the
+# `src` package resolves at runtime.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import gradio as gr
 

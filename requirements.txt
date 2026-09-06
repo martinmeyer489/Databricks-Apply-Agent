@@ -1,0 +1,7 @@
+# Runtime dependencies for the job-agent-app Databricks App (src/app/main.py).
+# Databricks Apps installs this file automatically before starting the app.
+gradio==5.49.1
+databricks-sdk==0.135.0
+PyPDF2==3.0.1
+python-docx==1.2.0
+requests==2.32.5

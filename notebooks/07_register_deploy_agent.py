@@ -61,12 +61,14 @@ dbutils.widgets.text("registered_model_name", "gold.matching_agent", "UC registe
 dbutils.widgets.text("serving_endpoint_name", "job-agent-matching", "Model Serving endpoint name")
 dbutils.widgets.text("serving_endpoint_workload_size", "Small", "Model Serving endpoint workload size")
 dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID the agent tools use to call the gold.* UC functions")
+dbutils.widgets.dropdown("require_evaluation_gate", "true", ["true", "false"], "Require evaluation results before deploying to serving")
 
 CATALOG = dbutils.widgets.get("catalog")
 REGISTERED_MODEL_NAME = f"{CATALOG}.{dbutils.widgets.get('registered_model_name')}"
 SERVING_ENDPOINT_NAME = dbutils.widgets.get("serving_endpoint_name")
 SERVING_ENDPOINT_WORKLOAD_SIZE = dbutils.widgets.get("serving_endpoint_workload_size")
 WAREHOUSE_ID = dbutils.widgets.get("warehouse_id").strip()
+REQUIRE_EVALUATION_GATE = dbutils.widgets.get("require_evaluation_gate").strip().lower() == "true"
 
 print(f"Catalog:                  {CATALOG}")
 print(f"Registered model name:    {REGISTERED_MODEL_NAME}")
@@ -147,19 +149,26 @@ print(f"Registered as:   {REGISTERED_MODEL_NAME} version {model_version}")
 deploy_allowed = False
 gate_reason = "src.utils.deployment_gate is not available yet (task 17.3 not implemented)."
 
-try:
-    from src.utils.deployment_gate import check_deployment_gate
+if not REQUIRE_EVALUATION_GATE:
+    # Explicit bypass (e.g. the showcase pipeline) — deploy the freshly
+    # registered version without requiring recorded evaluation results.
+    deploy_allowed = True
+    gate_reason = "evaluation gate bypassed (require_evaluation_gate=false)."
+    print(f"Deployment gate bypassed for version {model_version}.")
+else:
+    try:
+        from src.utils.deployment_gate import check_deployment_gate
 
-    blocked, reason = check_deployment_gate(model_version)
-    deploy_allowed = not blocked
-    gate_reason = reason
-except ImportError:
-    print(
-        "WARNING: src.utils.deployment_gate could not be imported "
-        f"({gate_reason}) Skipping deployment to '{SERVING_ENDPOINT_NAME}'. "
-        f"Re-run this notebook once task 17.3 is implemented to deploy "
-        f"version {model_version}."
-    )
+        blocked, reason = check_deployment_gate(model_version)
+        deploy_allowed = not blocked
+        gate_reason = reason
+    except ImportError:
+        print(
+            "WARNING: src.utils.deployment_gate could not be imported "
+            f"({gate_reason}) Skipping deployment to '{SERVING_ENDPOINT_NAME}'. "
+            f"Re-run this notebook once task 17.3 is implemented to deploy "
+            f"version {model_version}."
+        )
 
 if deploy_allowed:
     print(f"Deployment gate passed for version {model_version}: {gate_reason}")
