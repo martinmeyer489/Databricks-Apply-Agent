@@ -743,7 +743,7 @@ def build_app() -> gr.Blocks:
                     lines=15,
                     interactive=True,
                     label="Cover Letter (editable)",
-                    buttons=["copy"],
+                    show_copy_button=True,
                 )
 
                 draft_button.click(
