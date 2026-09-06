@@ -654,7 +654,7 @@ RESPONSIVE_LAYOUT_CSS = """
 
 def build_app() -> gr.Blocks:
     """Construct the Gradio Blocks app with the CV upload tab."""
-    with gr.Blocks(title="Databricks Job Agent") as demo:
+    with gr.Blocks(title="Databricks Job Agent", css=RESPONSIVE_LAYOUT_CSS) as demo:
         # `gr.State` scopes these to one browser session (Gradio session ID).
         # See `SESSION_IDLE_TIMEOUT_MINUTES` above for how Req 10.4's
         # 30-minute inactivity window relates to this session scoping.
@@ -770,7 +770,9 @@ demo = build_app()
 
 
 if __name__ == "__main__":
-    # `css` is a `launch()`-time parameter in gradio==6.26.0 (moved off the
-    # `Blocks` constructor in Gradio 6.0), so the responsive max-width CSS
-    # is applied here rather than in `build_app()`.
-    demo.launch(css=RESPONSIVE_LAYOUT_CSS)
+    # The responsive max-width CSS is applied on the gr.Blocks() constructor
+    # (see build_app). Databricks Apps expose the port to bind via the
+    # DATABRICKS_APP_PORT env var (default 8000); bind to 0.0.0.0 so the
+    # platform can route to the app.
+    _port = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+    demo.launch(server_name="0.0.0.0", server_port=_port)
