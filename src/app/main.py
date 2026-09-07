@@ -295,17 +295,20 @@ def handle_location_resolve(
         return user_profile, ""
 
     # Resolve via the SQL warehouse using the Databricks SDK, which works
-    # inside a Databricks App container (no ambient Spark session). Only fall
-    # back to the Spark/Databricks Connect path if the SDK path is unavailable.
+    # inside a Databricks App container (no ambient Spark session).
     try:
         resolved = resolve_location_via_warehouse(location_text)
-    except Exception:  # noqa: BLE001 - fall back to a Spark session if present
+    except ValueError as exc:
+        # Input validation failure (empty / too long) — show the message.
+        gr.Warning(str(exc))
+        return user_profile, ""
+    except Exception as exc:  # noqa: BLE001
+        # Fall back to a Spark session if one happens to be available
+        # (local dev / Databricks Connect); otherwise surface the actual
+        # error so the failure is diagnosable rather than misleading.
         spark = _get_spark_session()
         if spark is None:
-            gr.Warning(
-                "Location resolution requires a Databricks connection. "
-                "Please run this app as a Databricks App or configure Databricks Connect."
-            )
+            gr.Warning(f"Location resolution failed: {exc}")
             return user_profile, ""
         resolved = resolve_location(spark, location_text)
     if resolved is None:

@@ -43,5 +43,9 @@ resources:
             value: ${var.matching_agent_endpoint_name}
           - name: CV_UPLOADS_VOLUME_PATH
             value: /Volumes/${var.catalog}/volumes/cv_uploads
+          # The app code passes this directly as warehouse_id to
+          # WorkspaceClient().statement_execution.execute_statement(...), so it
+          # must be the bare warehouse id (a `value_from: sql_warehouse`
+          # reference injects connection metadata, not the id).
           - name: SQL_WAREHOUSE_ID
-            value_from: sql_warehouse
+            value: ${var.sql_warehouse_id}

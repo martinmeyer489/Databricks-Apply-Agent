@@ -1,7 +1,10 @@
 # Runtime dependencies for the job-agent-app Databricks App (src/app/main.py).
 # Databricks Apps installs this file automatically before starting the app.
 gradio==5.49.1
-databricks-sdk==0.135.0
+# The [openai] extra pulls in the `openai` package that
+# WorkspaceClient().serving_endpoints.get_open_ai_client() requires for the
+# CV parser and agent LLM calls.
+databricks-sdk[openai]==0.135.0
 PyPDF2==3.0.1
 python-docx==1.2.0
 requests==2.32.5
