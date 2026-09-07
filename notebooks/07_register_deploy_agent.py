@@ -126,11 +126,11 @@ from mlflow.models.signature import ModelSignature
 from mlflow.types.schema import ColSpec, Schema
 
 input_example = {"profile_id": "example-profile-id"}
-# Declare ONLY the input schema. An explicit string OUTPUT schema caused
-# Model Serving / pyfunc load to coerce the JSON-string result to null;
-# omitting the output schema lets the raw predict() return value pass through.
+# Unity Catalog requires BOTH input and output signatures. The pyfunc returns
+# a JSON string, so the output is a single string column.
 signature = ModelSignature(
     inputs=Schema([ColSpec("string", "profile_id")]),
+    outputs=Schema([ColSpec("string")]),
 )
 
 with mlflow.start_run(run_name="matching_agent_registration") as run:
