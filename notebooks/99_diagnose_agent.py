@@ -38,8 +38,17 @@ try:
     import pandas as pd
     model = mlflow.pyfunc.load_model(model_uri)
     out = model.predict(pd.DataFrame([{"profile_id": "demo-1"}]))
-    _result = f"loaded={model_uri} || pyfunc_predict_type={type(out).__name__} || out={str(out)[:400]}"
+    unwrapped = model.unwrap_python_model()
+    raw = unwrapped.predict(None, pd.DataFrame([{"profile_id": "demo-1"}]))
+    import inspect
+    predsrc = inspect.getsource(type(unwrapped).predict)
+    returns_list = "profile_ids" in predsrc
+    _result = (
+        f"loaded={model_uri} || pyfunc_out_type={type(out).__name__} pyfunc_out={str(out)[:150]} || "
+        f"unwrapped_raw_type={type(raw).__name__} unwrapped_raw={str(raw)[:200]} || "
+        f"unwrapped_predict_is_list_version={returns_list}"
+    )[:2200]
 except Exception as e:
     import traceback
-    _result = "RAISED: " + repr(e) + " || " + traceback.format_exc()[-1800:]
+    _result = "RAISED: " + repr(e) + " || " + traceback.format_exc()[-1600:]
 dbutils.notebook.exit(_result)
