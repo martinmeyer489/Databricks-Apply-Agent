@@ -136,7 +136,11 @@ signature = ModelSignature(
 with mlflow.start_run(run_name="matching_agent_registration") as run:
     logged_model_info = mlflow.pyfunc.log_model(
         artifact_path="matching_agent",
-        python_model=pyfunc_model,
+        # Models-from-code: pass the entry SCRIPT path (not an in-memory
+        # instance). MLflow executes it fresh at load time, so the served
+        # model always runs the current MatchingAgentModel.predict rather than
+        # a stale module snapshot pickled from an earlier import.
+        python_model=os.path.join(_REPO_ROOT, "src", "agent", "agent_model_entry.py"),
         code_paths=[os.path.join(_REPO_ROOT, "src")],
         input_example=input_example,
         signature=signature,
