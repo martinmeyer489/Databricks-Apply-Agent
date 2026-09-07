@@ -35,17 +35,11 @@ import pandas as pd
 
 _result = ""
 try:
-    from src.agent.matching_agent import MatchingAgentModel, _extract_profile_id
-    df = pd.DataFrame([{"profile_id": "demo-1"}])
-    pid = _extract_profile_id(df)
-    m = MatchingAgentModel()
-    m.load_context(None)
-    out = m.predict(None, df)
-    _result = (
-        f"extracted_pid={pid!r} || predict_type={type(out).__name__} || "
-        f"predict_out={out!r}"
-    )[:2400]
+    import pandas as pd
+    model = mlflow.pyfunc.load_model(model_uri)
+    out = model.predict(pd.DataFrame([{"profile_id": "demo-1"}]))
+    _result = f"loaded={model_uri} || pyfunc_predict_type={type(out).__name__} || out={str(out)[:400]}"
 except Exception as e:
-    _result = "RAISED: " + repr(e) + " || " + traceback.format_exc()[-2000:]
-
+    import traceback
+    _result = "RAISED: " + repr(e) + " || " + traceback.format_exc()[-1800:]
 dbutils.notebook.exit(_result)

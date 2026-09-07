@@ -451,6 +451,30 @@ def _extract_profile_id(model_input: Any) -> Optional[str]:
     return None
 
 
+def _extract_profile_ids(model_input: Any) -> List[Optional[str]]:
+    """Return one profile_id per input row (batch-aware).
+
+    MLflow enforces that the number of output rows matches the input, so the
+    pyfunc must emit one prediction per row. Handles pandas DataFrame, list of
+    dicts, and single dict inputs.
+    """
+    # pandas DataFrame
+    if hasattr(model_input, "to_dict") and not isinstance(model_input, dict):
+        try:
+            records = model_input.to_dict("records")
+            return [r.get("profile_id") for r in records] if records else [None]
+        except Exception:  # noqa: BLE001
+            return [None]
+    if isinstance(model_input, dict):
+        return [model_input.get("profile_id")]
+    if isinstance(model_input, list):
+        out = []
+        for item in model_input:
+            out.append(item.get("profile_id") if isinstance(item, dict) else None)
+        return out or [None]
+    return [None]
+
+
 class MatchingAgentModel:
     """`mlflow.pyfunc.PythonModel` adapter around :class:`MatchingAgent`.
 
@@ -472,12 +496,16 @@ class MatchingAgentModel:
 
         if not hasattr(self, "_agent") or self._agent is None:
             self._agent = MatchingAgent(tools=build_agent())
-        profile_id = _extract_profile_id(model_input)
-        result = self._agent.predict({"profile_id": profile_id})
-        # Return a JSON string rather than a raw dict: mlflow pyfunc serving
-        # coerces un-signatured dict outputs to null, whereas a string output
-        # round-trips reliably through the serving JSON envelope.
-        return _json.dumps(result)
+
+        # Determine how many rows were requested so the output row count
+        # matches the input (MLflow enforces the tabular output schema; a
+        # bare scalar string gets coerced to null, so return a list — one
+        # JSON string per input row).
+        profile_ids = _extract_profile_ids(model_input)
+        results = [
+            _json.dumps(self._agent.predict({"profile_id": pid})) for pid in profile_ids
+        ]
+        return results
 
 
 def make_pyfunc_model():
