@@ -6,9 +6,6 @@ searches a live corpus of German job listings, filters by real commute distance,
 ranks the best fits, and drafts a tailored cover letter — all in under 60 seconds,
 served from a Model Serving endpoint behind a Gradio app.
 
-The whole stack — ingestion jobs, the Vector Search endpoint, Unity Catalog function
-tools, and the app — is provisioned declaratively from a **Databricks Asset Bundle**
-(`databricks bundle deploy`). Nothing is clicked together by hand.
 
 ---
 
@@ -96,53 +93,3 @@ Jobsuche API ─▶ bronze.job_listings ─▶ silver.enriched_listings(_chunks)
 - **Privacy/offline geocoding**: location resolution never leaves the workspace.
 - **Declarative infra**: jobs, app, vector search, and grants live in
   `databricks.yml` + `resources/*.yml`.
-
-## Layout
-
-```
-notebooks/   Ordered pipeline (00 setup → 02 ingest → 03 enrich → 04 index → 06 tools → 07 deploy)
-src/agent/   Matching agent, CV parser, location resolver
-src/app/     Gradio frontend (job-agent-app)
-src/models/  Dataclasses & Delta table schemas
-src/utils/   Validation, retry/backoff, haversine, checkpoints, deployment gate
-resources/   Bundle resource definitions (jobs, app, vector search, grants)
-tests/       unit · property (Hypothesis) · integration (live Databricks)
-data/        Bundled fallback listings + geocode lookup
-```
-
-## Deploy
-
-Requires the [Databricks CLI](https://docs.databricks.com/dev-tools/cli/) with a
-configured workspace profile.
-
-```bash
-databricks bundle validate       # check the bundle
-databricks bundle deploy         # provision jobs, app, vector search (dev target)
-```
-
-The `dev` target runs in development mode (source-linked, per-developer isolation),
-so repeated deploys are safe.
-
-## Testing
-
-Three tiers. Put the repo root on `PYTHONPATH` when running locally:
-
-```bash
-pip install -e .                 # or: pip install -r requirements.txt
-PYTHONPATH=. pytest              # unit + property; integration auto-skips locally
-```
-
-- **Unit** (`tests/unit/`) — CV parser, matching agent, pipelines, location logic.
-- **Property** (`tests/property/`) — [Hypothesis](https://hypothesis.works/)-driven
-  invariants: commute filtering, cover-letter generation, retry logic,
-  checkpoint/resume, MERGE upserts, chunking, and more.
-- **Integration** (`tests/integration/`) — exercise live Vector Search, Model Serving,
-  the SQL warehouse, and Unity Catalog. A shared environment gate **auto-skips** them
-  off-workspace, so they never fail on a laptop:
-
-```bash
-PYTHONPATH=. pytest -m integration     # skipped locally, runs in-workspace
-```
-
-> Targets **Python 3.10–3.12**. Some pinned runtime deps (e.g. `gradio==5.49.1`) do
-> not build on newer interpreters; use a 3.10–3.12 virtualenv for a clean run.
