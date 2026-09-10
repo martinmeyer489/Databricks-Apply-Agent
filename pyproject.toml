@@ -8,6 +8,8 @@ dependencies = [
     "databricks-langchain",
     "mlflow",
     "gradio",
+    "plotly",
+    "pandas",
     "PyPDF2",
     "python-docx",
     "hypothesis",

@@ -23,6 +23,14 @@ resources:
       max_concurrent_runs: 1
       queue:
         enabled: true
+      # Run the full ingest→enrich→index→deploy chain once a day so the map and
+      # the matching corpus pick up fresh Bundesagentur für Arbeit postings.
+      # Quartz cron (seconds minutes hours day-of-month month day-of-week):
+      # 04:00 every day, Europe/Berlin. UNPAUSED so the corpus refreshes daily.
+      schedule:
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: "Europe/Berlin"
+        pause_status: UNPAUSED
       tags:
         project: databricks-job-agent
       parameters:
@@ -34,6 +42,24 @@ resources:
           default: ${var.vs_endpoint_name}
         - name: matching_agent_endpoint_name
           default: ${var.matching_agent_endpoint_name}
+        # Pages per search query fetched from the Jobsuche API (size=500, API
+        # window caps page*size at 10 000 → max 20 pages/query).
+        - name: max_pages
+          default: "20"
+        # Total unique listings to ingest before stopping. The LLM-derived
+        # "vibe" filters (company_vibe/office_policy/benefits_rating) need the
+        # job description text to be meaningful, and descriptions are fetched
+        # one-HTTP-call-per-listing (see fetch_descriptions), so this is capped
+        # to a few thousand to stay within the ingest task timeout while still
+        # giving the map good density and the filters real, varied values.
+        - name: max_records
+          default: "10000"
+        # "true" fetches each listing's description so the enrichment LLM has
+        # real text to infer skills/seniority AND the vibe attributes from.
+        # (Set to "false" for a fast, description-less pull when only map
+        # density matters.)
+        - name: fetch_descriptions
+          default: "true"
 
       # Serverless environments providing the PyPI dependencies that specific
       # notebooks import (not present in the default serverless runtime).
@@ -84,7 +110,12 @@ resources:
             notebook_path: ../notebooks/02_ingest_listings.py
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
-          timeout_seconds: 3600
+              max_pages: "{{job.parameters.max_pages}}"
+              max_records: "{{job.parameters.max_records}}"
+              fetch_descriptions: "{{job.parameters.fetch_descriptions}}"
+          # A 10k pull with a per-listing description detail call is I/O-bound;
+          # allow up to ~2.5h so it completes rather than timing out.
+          timeout_seconds: 9000
           max_retries: 1
 
         - task_key: enrich_listings
@@ -95,7 +126,9 @@ resources:
             base_parameters:
               catalog: "{{job.parameters.catalog}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
-          timeout_seconds: 3600
+          # LLM enrichment of ~10k rows via ai_query batches is the other long
+          # step; batches checkpoint so a timeout resumes, but allow ~2.5h.
+          timeout_seconds: 9000
           max_retries: 1
 
         - task_key: sync_vector_index

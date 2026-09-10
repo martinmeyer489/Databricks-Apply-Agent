@@ -12,6 +12,7 @@ from hypothesis import given, strategies as st
 from src.pipelines.enrichment_state import (
     ALL_ATTRIBUTES,
     LLM_ATTRIBUTES,
+    SOFT_LLM_ATTRIBUTES,
     determine_enrichment_state,
 )
 
@@ -87,10 +88,50 @@ def test_enrichment_state_machine_totality(geocode_result, llm_result):
 
     if state == "enriched":
         assert failure_reason is None
-        assert unresolved_attributes == []
+        # Soft (vibe) attributes never gate the enriched state, but may still
+        # be reported as unresolved; the required attributes must all be
+        # resolved when enriched.
+        assert all(attr in SOFT_LLM_ATTRIBUTES for attr in unresolved_attributes)
     else:
         assert isinstance(failure_reason, str)
         assert len(failure_reason) > 0
+
+
+# --- Soft (vibe) attribute behaviour ------------------------------------
+
+
+def _all_required_resolved():
+    return {
+        "required_skills": ["python"],
+        "seniority_level": "Senior",
+        "employment_type": "Full-time",
+        "industry": "Tech",
+        "company_size_band": "Medium",
+    }
+
+
+def test_missing_soft_attributes_do_not_downgrade_enriched():
+    """A record with all required attrs + coords is 'enriched' even when the
+    soft vibe attributes are absent — they must not drop it from the map."""
+    geocode = {"latitude": 52.5, "longitude": 13.4}
+    state, unresolved, failure_reason = determine_enrichment_state(
+        geocode, _all_required_resolved()
+    )
+    assert state == "enriched"
+    assert failure_reason is None
+    assert set(unresolved) == set(SOFT_LLM_ATTRIBUTES)
+
+
+def test_resolved_soft_attributes_leave_unresolved_empty():
+    """When soft attributes are also resolved, unresolved is empty."""
+    geocode = {"latitude": 52.5, "longitude": 13.4}
+    llm = _all_required_resolved()
+    llm.update({"company_vibe": "fast-paced startup", "office_policy": "hybrid",
+                "benefits_rating": "good"})
+    state, unresolved, failure_reason = determine_enrichment_state(geocode, llm)
+    assert state == "enriched"
+    assert unresolved == []
+    assert failure_reason is None
 
 
 # --- Property 10: Unenriched-Only Processing Filter ---------------------

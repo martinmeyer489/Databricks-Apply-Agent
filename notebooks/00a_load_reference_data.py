@@ -63,6 +63,30 @@ print(f"Target table:    {TABLE_NAME}")
 import os
 import shutil
 
+# Idempotency guard (important for the daily scheduled pipeline): the geocode
+# reference dataset is static, so if the target table already holds a healthy
+# number of rows there is nothing to reload. This also makes the task robust
+# when the bundled CSV is not reachable from the serverless working directory
+# (Workspace file sync), which would otherwise fail the whole pipeline on an
+# essentially no-op step.
+_already_loaded = False
+if spark.catalog.tableExists(TABLE_NAME):
+    try:
+        _existing_rows = spark.table(TABLE_NAME).count()
+    except Exception:  # noqa: BLE001
+        _existing_rows = 0
+    if _existing_rows >= 100:
+        print(
+            f"{TABLE_NAME} already has {_existing_rows} rows — skipping reload "
+            "of the static geocode reference dataset."
+        )
+        _already_loaded = True
+
+if _already_loaded:
+    dbutils.notebook.exit(
+        f"skipped: {TABLE_NAME} already populated ({_existing_rows} rows)"
+    )
+
 os.makedirs(VOLUME_PATH, exist_ok=True)
 
 # Resolve the local CSV path against the notebook's working directory when run

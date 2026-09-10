@@ -61,6 +61,18 @@ dbutils.widgets.text("job_search_query", "Softwareentwickler", "Job title search
 dbutils.widgets.text("location_search", "Berlin", "Location search term")
 dbutils.widgets.text("max_pages", "2", "Maximum pages to fetch from API")
 
+# Total unique listings to fetch before stopping (across all CANDIDATE_PARAMS
+# queries). Default 10000 for a showcase-sized corpus.
+dbutils.widgets.text("max_records", "10000", "Max unique listings to fetch")
+# Whether to fetch each listing's full description from the per-job detail
+# endpoint. This is one extra HTTP call PER listing, so for large pulls
+# (thousands of records) it dominates runtime; the map only needs
+# title/company/location/coords (all present on the search result), so
+# descriptions can be skipped for speed and back-filled later if desired.
+dbutils.widgets.dropdown(
+    "fetch_descriptions", "false", ["true", "false"], "Fetch per-listing descriptions"
+)
+
 CATALOG = dbutils.widgets.get("catalog")
 BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
 REQUEST_TIMEOUT_SECONDS = int(dbutils.widgets.get("request_timeout_seconds"))
@@ -68,6 +80,8 @@ LOCAL_FALLBACK_CSV_PATH = dbutils.widgets.get("local_fallback_csv_path")
 JOB_SEARCH_QUERY = dbutils.widgets.get("job_search_query")
 LOCATION_SEARCH = dbutils.widgets.get("location_search")
 MAX_PAGES = int(dbutils.widgets.get("max_pages"))
+MAX_RECORDS = int(dbutils.widgets.get("max_records"))
+FETCH_DESCRIPTIONS = dbutils.widgets.get("fetch_descriptions").strip().lower() == "true"
 
 import uuid  # noqa: E402
 
@@ -252,6 +266,8 @@ def fetch_jobs_from_api(
     location: str,
     max_pages: int,
     timeout_seconds: int,
+    max_records: int = 200,
+    fetch_descriptions: bool = False,
 ) -> list[dict]:
     """Fetch job listings from the Jobsuche API using multiple search param combinations.
 
@@ -339,31 +355,34 @@ def fetch_jobs_from_api(
 
                 # The description is only on the detail endpoint. Fetch it, but
                 # a detail failure is non-fatal — keep the listing with an empty
-                # description rather than dropping it.
+                # description rather than dropping it. For large pulls this
+                # per-listing call is skipped (FETCH_DESCRIPTIONS=false) so the
+                # ingest stays within its timeout; the map does not need it.
                 job_description = ""
-                try:
-                    detail_url = (
-                        "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/"
-                        f"pc/v4/jobdetails/{base64.b64encode(refnr.encode()).decode()}"
-                    )
-                    detail_response = requests.get(
-                        detail_url,
-                        headers=JOBSUCHE_HEADERS,
-                        timeout=timeout_seconds,
-                    )
-                    detail_response.raise_for_status()
-                    detail_data = detail_response.json()
-                    job_description = (
-                        detail_data.get("stellenangebotsBeschreibung")
-                        or detail_data.get("stellenbeschreibung")
-                        or ""
-                    )
-                except Exception as exc:  # noqa: BLE001 - non-fatal
-                    api_errors.append({
-                        "source_domain": "arbeitsagentur.de",
-                        "error_message": f"Details API failed for refnr {refnr}: {exc}",
-                        "error_type": "api_error",
-                    })
+                if fetch_descriptions:
+                    try:
+                        detail_url = (
+                            "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/"
+                            f"pc/v4/jobdetails/{base64.b64encode(refnr.encode()).decode()}"
+                        )
+                        detail_response = requests.get(
+                            detail_url,
+                            headers=JOBSUCHE_HEADERS,
+                            timeout=timeout_seconds,
+                        )
+                        detail_response.raise_for_status()
+                        detail_data = detail_response.json()
+                        job_description = (
+                            detail_data.get("stellenangebotsBeschreibung")
+                            or detail_data.get("stellenbeschreibung")
+                            or ""
+                        )
+                    except Exception as exc:  # noqa: BLE001 - non-fatal
+                        api_errors.append({
+                            "source_domain": "arbeitsagentur.de",
+                            "error_message": f"Details API failed for refnr {refnr}: {exc}",
+                            "error_type": "api_error",
+                        })
 
                 # Build a stable source URL (the BA job portal URL)
                 source_url = f"https://www.arbeitsagentur.de/jobsuche/jobdetails/{refnr}"
@@ -377,8 +396,8 @@ def fetch_jobs_from_api(
                 })
 
         # Stop if we have enough records
-        if len(records) >= 200:
-            print(f"\nReached {len(records)} records, stopping early")
+        if len(records) >= max_records:
+            print(f"\nReached {len(records)} records (max_records={max_records}), stopping early")
             break
 
     print(f"\nTotal unique jobs fetched: {len(records)}")
@@ -398,6 +417,8 @@ else:
             location=LOCATION_SEARCH,       # legacy param, ignored
             max_pages=MAX_PAGES,
             timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+            max_records=MAX_RECORDS,
+            fetch_descriptions=FETCH_DESCRIPTIONS,
         )
         print(f"Fetched {len(candidate_records)} job(s) from Jobsuche API")
         

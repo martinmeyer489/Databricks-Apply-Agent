@@ -8,3 +8,8 @@ databricks-sdk[openai]==0.135.0
 PyPDF2==3.0.1
 python-docx==1.2.0
 requests==2.32.5
+# Plotly renders the interactive job-listings map shown via gr.Plot in
+# src/app/main.py; pandas shapes the listing rows fetched from the SQL
+# warehouse into the frame the map/table consume.
+plotly==5.24.1
+pandas==2.2.3

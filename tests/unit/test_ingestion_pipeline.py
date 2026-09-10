@@ -212,6 +212,7 @@ def test_fetch_jobs_from_api_returns_records(notebook_funcs):
             location="Berlin",
             max_pages=1,
             timeout_seconds=30,
+            fetch_descriptions=True,
         )
 
     assert len(records) == 1
@@ -220,6 +221,38 @@ def test_fetch_jobs_from_api_returns_records(notebook_funcs):
     assert records[0]["job_description"] == "We are hiring!"
     assert records[0]["location_text"] == "10115, Berlin, Berlin"
     assert "10001-123456789-S" in records[0]["source_url"]
+
+
+def test_fetch_jobs_from_api_skips_descriptions_by_default(notebook_funcs):
+    """With fetch_descriptions off (default), no detail call is made and the
+    description is empty — the fast path used for large (10k) pulls."""
+    search_response = _FakeResponse(200, {
+        "ergebnisliste": [
+            {
+                "referenznummer": "10002-987654321-S",
+                "stellenangebotsTitel": "Data Scientist",
+                "firma": "Acme",
+                "stellenlokationen": [
+                    {"adresse": {"plz": "80331", "ort": "Munich", "region": "Bayern"}}
+                ],
+            }
+        ]
+    })
+    saw_detail = {"called": False}
+
+    def fake_get(url, **kwargs):
+        if "/jobdetails/" in url:
+            saw_detail["called"] = True
+        return search_response
+
+    with patch("requests.get", side_effect=fake_get), patch("time.sleep"):
+        records = notebook_funcs["fetch_jobs_from_api"](
+            search_query="x", location="y", max_pages=1, timeout_seconds=30,
+        )
+
+    assert len(records) == 1
+    assert records[0]["job_description"] == ""
+    assert saw_detail["called"] is False
 
 
 def test_fetch_jobs_from_api_handles_empty_results(notebook_funcs):

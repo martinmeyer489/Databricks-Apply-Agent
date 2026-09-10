@@ -56,9 +56,21 @@ LLM_ATTRIBUTES = (
     "company_size_band",
 )
 
+# Soft, LLM-inferred "vibe" attributes used only as optional filters
+# (company_vibe, office_policy, benefits_rating). Unlike LLM_ATTRIBUTES these
+# are best-effort: a job description often does not state them, so their
+# absence must NOT downgrade a listing to partially_enriched or drop it from
+# the map (which filters on enrichment_state = 'enriched'). They are recorded
+# in unresolved_attributes for observability but never gate the state.
+SOFT_LLM_ATTRIBUTES = (
+    "company_vibe",
+    "office_policy",
+    "benefits_rating",
+)
+
 LOCATION_ATTRIBUTE = "location"
 
-ALL_ATTRIBUTES = (LOCATION_ATTRIBUTE,) + LLM_ATTRIBUTES
+ALL_ATTRIBUTES = (LOCATION_ATTRIBUTE,) + LLM_ATTRIBUTES + SOFT_LLM_ATTRIBUTES
 
 
 def _is_geocode_resolved(geocode_result: Optional[dict]) -> bool:
@@ -105,6 +117,19 @@ def _unresolved_llm_fields(llm_result: Optional[dict]) -> List[str]:
     return unresolved
 
 
+def _unresolved_soft_fields(llm_result: Optional[dict]) -> List[str]:
+    """Return the names of soft (vibe) attributes not resolved in llm_result."""
+    unresolved: List[str] = []
+    result = llm_result or {}
+    for attribute in SOFT_LLM_ATTRIBUTES:
+        value = result.get(attribute)
+        if value is None:
+            unresolved.append(attribute)
+        elif isinstance(value, (list, str)) and len(value) == 0:
+            unresolved.append(attribute)
+    return unresolved
+
+
 def determine_enrichment_state(
     geocode_result: Optional[dict],
     llm_result: Optional[dict],
@@ -128,14 +153,21 @@ def determine_enrichment_state(
 
     geocode_resolved = _is_geocode_resolved(geocode_result)
     unresolved_llm = _unresolved_llm_fields(llm_result)
+    # Soft attributes are reported as unresolved when missing, but do not
+    # affect the enriched/partially_enriched decision below.
+    unresolved_soft = _unresolved_soft_fields(llm_result)
 
     unresolved: List[str] = []
     if not geocode_resolved:
         unresolved.append(LOCATION_ATTRIBUTE)
     unresolved.extend(unresolved_llm)
 
+    # Enriched state is decided solely by location + the required LLM
+    # attributes; soft vibe attributes never downgrade it.
     if not unresolved:
-        return "enriched", [], None
+        return "enriched", list(unresolved_soft), None
+
+    unresolved.extend(unresolved_soft)
 
     reasons = []
     if not geocode_resolved:

@@ -1,245 +1,225 @@
-"""Unit tests for the Gradio app (Task 16.7).
+"""Unit tests for the map + chat Gradio app.
 
-Exercises the pure/testable event-handler helpers in `src.app.main` without
-requiring a live Databricks connection:
+Exercises the pure/testable pieces of the redesigned frontend without a live
+Databricks connection:
 
-1. Auto-stop 503 detection (`_is_auto_stop_error`, `_auto_stop_restart_message`)
-2. Session state preservation across failure paths in
-   `handle_find_matches` / `handle_draft_application`
-3. Completeness gate messaging for various combinations of missing fields
+1. ``listings_loader`` — SQL query building (filters, skill search, escaping,
+   limit cap) and row → dict coercion.
+2. ``map_figure`` — Plotly figure construction from listing rows (empty and
+   populated), version-robust across Plotly 5/6.
+3. ``chat_handler`` — grounded-answer behaviour and graceful degradation.
+4. ``main`` — ``refresh_map`` failure handling and ``handle_chat`` history
+   management, without reaching the warehouse or the model.
 
-Validates: Requirements 10.4, 10.7, 10.8, 11.5
+Validates: Requirement 10 (frontend) for the map + chat redesign.
 """
 
 from unittest.mock import patch
 
-import pytest
-
-from src.app.main import (
-    INITIAL_USER_PROFILE,
-    MISSING_FIELD_DESCRIPTIONS,
-    _auto_stop_restart_message,
-    _build_completeness_gate_message,
-    _is_auto_stop_error,
-    handle_draft_application,
-    handle_find_matches,
-)
+from src.app import chat_handler, listings_loader, main, map_figure
 
 
 # ---------------------------------------------------------------------------
-# 1. Auto-stop 503 detection
+# 1. listings_loader — query building
 # ---------------------------------------------------------------------------
 
-class _FakeHTTPError(Exception):
-    """A fake exception exposing a `status_code` attribute, like an SDK error."""
-
-    def __init__(self, status_code, message="request failed"):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class _FakeResponse:
-    def __init__(self, status_code):
-        self.status_code = status_code
+def test_build_query_only_returns_mappable_enriched_rows():
+    query = listings_loader.build_listings_query()
+    assert "enrichment_state = 'enriched'" in query
+    assert "latitude IS NOT NULL" in query
+    assert "longitude IS NOT NULL" in query
+    assert "LIMIT" in query
 
 
-class _FakeResponseWrappedError(Exception):
-    """A fake exception exposing `.response.status_code`, like `requests`."""
-
-    def __init__(self, status_code, message="request failed"):
-        super().__init__(message)
-        self.response = _FakeResponse(status_code)
-
-
-def test_is_auto_stop_error_true_for_status_code_attribute():
-    assert _is_auto_stop_error(_FakeHTTPError(503)) is True
-
-
-def test_is_auto_stop_error_true_for_response_status_code_attribute():
-    assert _is_auto_stop_error(_FakeResponseWrappedError(503)) is True
-
-
-def test_is_auto_stop_error_true_for_503_in_message():
-    assert _is_auto_stop_error(RuntimeError("Service Unavailable: 503")) is True
-
-
-def test_is_auto_stop_error_false_for_generic_exception():
-    assert _is_auto_stop_error(RuntimeError("something went wrong")) is False
-
-
-def test_is_auto_stop_error_false_for_500_status():
-    assert _is_auto_stop_error(_FakeHTTPError(500)) is False
-    assert _is_auto_stop_error(_FakeResponseWrappedError(500)) is False
-
-
-def test_auto_stop_restart_message_content():
-    message = _auto_stop_restart_message()
-    assert "24 hours" in message
-    assert "Restart" in message
-
-
-# ---------------------------------------------------------------------------
-# 2. Session state preservation
-# ---------------------------------------------------------------------------
-
-def _complete_profile():
-    profile = dict(INITIAL_USER_PROFILE)
-    profile.update(
-        {
-            "skills": ["python", "spark"],
-            "home_latitude": 52.5200,
-            "home_longitude": 13.4050,
-            "commute_radius_km": 25,
-        }
+def test_build_query_applies_categorical_filters():
+    query = listings_loader.build_listings_query(
+        filters={"industry": "Tech", "seniority_level": "Senior"}
     )
-    return profile
+    assert "industry = 'Tech'" in query
+    assert "seniority_level = 'Senior'" in query
 
 
-def test_handle_find_matches_preserves_profile_on_endpoint_failure():
-    original_profile = _complete_profile()
-    profile_copy = dict(original_profile)
+def test_build_query_ignores_all_sentinel_and_empty_filters():
+    query = listings_loader.build_listings_query(
+        filters={"industry": "All", "seniority_level": "", "employment_type": None}
+    )
+    assert "industry =" not in query
+    assert "seniority_level =" not in query
+    assert "employment_type =" not in query
 
-    with patch(
-        "src.app.main._invoke_matching_agent",
-        return_value=(None, RuntimeError("boom")),
-    ):
-        # handle_find_matches does not return user_profile as an output
-        # (it is not part of this handler's outputs), so the returned
-        # results/messages should reflect failure while the caller's
-        # profile dict itself must remain byte-for-byte unchanged.
-        results_table, message, results_list, dropdown_update = handle_find_matches(
-            profile_copy
+
+def test_build_query_skill_search_matches_title_and_skills_text():
+    query = listings_loader.build_listings_query(skill_query="Python")
+    assert "LOWER(job_title) LIKE '%python%'" in query
+    assert "required_skills_text" in query
+
+
+def test_build_query_escapes_single_quotes():
+    query = listings_loader.build_listings_query(filters={"industry": "O'Reilly"})
+    assert "O''Reilly" in query
+
+
+def test_build_query_caps_limit_at_max():
+    query = listings_loader.build_listings_query(limit=100_000)
+    assert f"LIMIT {listings_loader.MAX_LISTINGS}" in query
+
+
+def test_build_query_applies_soft_vibe_filters():
+    query = listings_loader.build_listings_query(
+        filters={"office_policy": "hybrid", "benefits_rating": "good",
+                 "company_vibe": "fast-paced startup"}
+    )
+    assert "office_policy = 'hybrid'" in query
+    assert "benefits_rating = 'good'" in query
+    assert "company_vibe = 'fast-paced startup'" in query
+
+
+def test_rows_to_dicts_coerces_coordinates_and_drops_bad_rows():
+    columns = list(listings_loader.LISTING_COLUMNS)
+    # Order matches LISTING_COLUMNS: id, title, company, location, url, lat, lon,
+    # seniority, employment, industry, size, vibe, office, benefits, skills.
+    good = ["id1", "Dev", "ACME", "Berlin", "http://x", "52.52", "13.40",
+            "Senior", "Full-time", "Tech", "Medium",
+            "fast-paced", "hybrid", "good", "python, sql"]
+    bad = ["id2", "Dev", "ACME", "Berlin", "http://x", "not-a-number", "13.40",
+           "Senior", "Full-time", "Tech", "Medium",
+           "corporate", "onsite", "basic", "python"]
+    rows = listings_loader._rows_to_dicts(columns, [good, bad])
+    assert len(rows) == 1
+    assert rows[0]["latitude"] == 52.52
+    assert isinstance(rows[0]["longitude"], float)
+    assert rows[0]["office_policy"] == "hybrid"
+
+
+def test_load_filter_options_degrades_to_all_without_warehouse(monkeypatch):
+    monkeypatch.delenv("SQL_WAREHOUSE_ID", raising=False)
+    monkeypatch.delenv("DATABRICKS_WAREHOUSE_ID", raising=False)
+    options = listings_loader.load_filter_options()
+    assert set(options.keys()) == set(listings_loader.FILTER_COLUMNS.keys())
+    for values in options.values():
+        assert values == ["All"]
+
+
+# ---------------------------------------------------------------------------
+# 2. map_figure
+# ---------------------------------------------------------------------------
+
+def test_build_map_figure_empty_has_no_points():
+    fig = map_figure.build_map_figure([])
+    assert len(fig.data) == 1
+    assert len(fig.data[0].lat) == 0
+
+
+def test_build_map_figure_plots_each_listing():
+    listings = [
+        {"job_title": "Data Engineer", "company_name": "ACME", "location_text": "Berlin",
+         "latitude": 52.52, "longitude": 13.40, "industry": "Tech", "seniority_level": "Senior"},
+        {"job_title": "ML Engineer", "company_name": "Beta", "location_text": "Munich",
+         "latitude": 48.14, "longitude": 11.58, "industry": "Tech", "seniority_level": "Mid"},
+    ]
+    fig = map_figure.build_map_figure(listings)
+    assert len(fig.data[0].lat) == 2
+    assert "Data Engineer" in fig.data[0].text[0]
+
+
+def test_build_map_figure_enables_clustering():
+    fig = map_figure.build_map_figure([
+        {"job_title": "J", "company_name": "C", "latitude": 52.5, "longitude": 13.4},
+    ])
+    assert fig.data[0].cluster.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# 3. chat_handler
+# ---------------------------------------------------------------------------
+
+def test_answer_question_blank_prompts_for_input():
+    assert "type a question" in chat_handler.answer_question("   ", [{"job_title": "x"}]).lower()
+
+
+def test_answer_question_no_listings_returns_guidance():
+    assert chat_handler.answer_question("any python jobs?", []) == chat_handler.NO_LISTINGS_MESSAGE
+
+
+def test_answer_question_grounds_on_listings_and_returns_model_text():
+    listings = [{"job_title": "Data Engineer", "company_name": "ACME",
+                 "location_text": "Berlin", "required_skills_text": "python, sql"}]
+    with patch.object(chat_handler, "_query_chat_llm", return_value="ACME is hiring a Data Engineer.") as m:
+        answer = chat_handler.answer_question("who wants python?", listings)
+    assert answer == "ACME is hiring a Data Engineer."
+    # The context passed to the model mentions the listing.
+    context_arg = m.call_args.args[1]
+    assert "Data Engineer" in context_arg
+    assert "ACME" in context_arg
+
+
+def test_answer_question_degrades_gracefully_on_model_error():
+    listings = [{"job_title": "Dev", "company_name": "ACME"}]
+    with patch.object(chat_handler, "_query_chat_llm", side_effect=RuntimeError("boom")):
+        answer = chat_handler.answer_question("q?", listings)
+    assert "couldn't reach the language model" in answer
+
+
+def test_build_listings_context_caps_at_max():
+    many = [{"job_title": f"Role {i}", "company_name": "C"} for i in range(100)]
+    context = chat_handler.build_listings_context(many)
+    # Header reports the true total, body is capped.
+    assert "100 listings" in context
+    assert context.count("\n- ") == chat_handler.MAX_CONTEXT_LISTINGS
+
+
+# ---------------------------------------------------------------------------
+# 4. main handlers
+# ---------------------------------------------------------------------------
+
+def test_refresh_map_returns_error_status_without_warehouse(monkeypatch):
+    monkeypatch.delenv("SQL_WAREHOUSE_ID", raising=False)
+    monkeypatch.delenv("DATABRICKS_WAREHOUSE_ID", raising=False)
+    fig, table, state, status = main.refresh_map(
+        "All", "All", "All", "All", "All", "All", "All", ""
+    )
+    assert state == []
+    assert table["data"] == []
+    assert "Could not load listings" in status
+    assert len(fig.data[0].lat) == 0
+
+
+def test_refresh_map_populates_from_loaded_listings():
+    listings = [
+        {"job_title": "Data Engineer", "company_name": "ACME", "location_text": "Berlin",
+         "latitude": 52.52, "longitude": 13.40, "seniority_level": "Senior", "industry": "Tech",
+         "office_policy": "hybrid", "benefits_rating": "good", "company_vibe": "fast-paced",
+         "source_url": "https://arbeitsagentur.de/jobs/1"},
+    ]
+    with patch.object(main, "load_listings", return_value=listings):
+        fig, table, state, status = main.refresh_map(
+            "All", "All", "All", "All", "All", "All", "All", ""
         )
-
-    assert profile_copy == original_profile
-    assert results_table == {"headers": results_table["headers"], "data": []}
-    assert results_list == []
-
-
-def test_handle_find_matches_preserves_profile_on_incomplete_gate():
-    incomplete_profile = dict(INITIAL_USER_PROFILE)
-    profile_copy = dict(incomplete_profile)
-
-    results_table, message, results_list, dropdown_update = handle_find_matches(
-        profile_copy
-    )
-
-    assert profile_copy == incomplete_profile
-    assert results_list == []
-    assert "Complete these steps" in message
+    assert state == listings
+    assert table["data"][0][0] == "Data Engineer"
+    assert "hybrid" in table["data"][0]
+    # Last column is a clickable markdown link to the job posting.
+    assert table["data"][0][-1] == "[View job](https://arbeitsagentur.de/jobs/1)"
+    assert "Showing" in status
+    assert len(fig.data[0].lat) == 1
 
 
-def test_handle_draft_application_preserves_profile_on_endpoint_failure():
-    original_profile = _complete_profile()
-    profile_copy = dict(original_profile)
-
-    with patch(
-        "src.app.main._invoke_draft_application",
-        return_value=(None, RuntimeError("boom")),
-    ):
-        cover_letter = handle_draft_application("listing-1", profile_copy)
-
-    assert profile_copy == original_profile
-    assert cover_letter == ""
+def test_handle_chat_ignores_blank_message():
+    text, history = main.handle_chat("   ", [], [{"job_title": "x"}])
+    assert text == ""
+    assert history == []
 
 
-def test_handle_draft_application_preserves_profile_when_no_listing_selected():
-    original_profile = _complete_profile()
-    profile_copy = dict(original_profile)
-
-    cover_letter = handle_draft_application(None, profile_copy)
-
-    assert profile_copy == original_profile
-    assert cover_letter == ""
-
-
-# ---------------------------------------------------------------------------
-# 3. Completeness gate with various missing fields
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "missing_fields",
-    [
-        ["skills"],
-        ["home_coordinates"],
-        ["commute_radius_km"],
-        ["skills", "home_coordinates"],
-        ["skills", "commute_radius_km"],
-        ["home_coordinates", "commute_radius_km"],
-        ["skills", "home_coordinates", "commute_radius_km"],
-    ],
-)
-def test_build_completeness_gate_message_names_missing_steps(missing_fields):
-    message = _build_completeness_gate_message(missing_fields)
-    for field in missing_fields:
-        assert MISSING_FIELD_DESCRIPTIONS[field] in message
-
-    # Fields NOT missing should not have their descriptions present, unless
-    # another missing field happens to share the same description text.
-    present_descriptions = {MISSING_FIELD_DESCRIPTIONS[f] for f in missing_fields}
-    for field, description in MISSING_FIELD_DESCRIPTIONS.items():
-        if field not in missing_fields and description not in present_descriptions:
-            assert description not in message
+def test_handle_chat_appends_user_and_assistant_turns():
+    with patch.object(main, "answer_question", return_value="Here are the roles."):
+        text, history = main.handle_chat("show me jobs", [], [{"job_title": "Dev"}])
+    assert text == ""
+    assert history == [
+        {"role": "user", "content": "show me jobs"},
+        {"role": "assistant", "content": "Here are the roles."},
+    ]
 
 
-def test_handle_find_matches_gate_missing_skills_only():
-    profile = dict(INITIAL_USER_PROFILE)
-    profile["home_latitude"] = 52.52
-    profile["home_longitude"] = 13.40
-    profile["commute_radius_km"] = 30
-
-    _, message, _, _ = handle_find_matches(profile)
-
-    assert MISSING_FIELD_DESCRIPTIONS["skills"] in message
-    assert MISSING_FIELD_DESCRIPTIONS["home_coordinates"] not in message
-    assert MISSING_FIELD_DESCRIPTIONS["commute_radius_km"] not in message
-
-
-def test_handle_find_matches_gate_missing_coordinates_only():
-    profile = dict(INITIAL_USER_PROFILE)
-    profile["skills"] = ["python"]
-    profile["commute_radius_km"] = 30
-
-    _, message, _, _ = handle_find_matches(profile)
-
-    assert MISSING_FIELD_DESCRIPTIONS["home_coordinates"] in message
-    assert MISSING_FIELD_DESCRIPTIONS["skills"] not in message
-
-
-def test_handle_find_matches_gate_missing_radius_only():
-    profile = dict(INITIAL_USER_PROFILE)
-    profile["skills"] = ["python"]
-    profile["home_latitude"] = 52.52
-    profile["home_longitude"] = 13.40
-    profile["commute_radius_km"] = None
-
-    _, message, _, _ = handle_find_matches(profile)
-
-    assert MISSING_FIELD_DESCRIPTIONS["commute_radius_km"] in message
-    assert MISSING_FIELD_DESCRIPTIONS["skills"] not in message
-    assert MISSING_FIELD_DESCRIPTIONS["home_coordinates"] not in message
-
-
-def test_handle_find_matches_gate_all_missing():
-    profile = dict(INITIAL_USER_PROFILE)
-    # INITIAL_USER_PROFILE defaults commute_radius_km to 50 (the slider's
-    # default value), so force it to None to exercise all three gates.
-    profile["commute_radius_km"] = None
-
-    _, message, _, _ = handle_find_matches(profile)
-
-    for description in MISSING_FIELD_DESCRIPTIONS.values():
-        assert description in message
-
-
-def test_handle_find_matches_proceeds_when_profile_complete():
-    profile = _complete_profile()
-
-    with patch(
-        "src.app.main._invoke_matching_agent",
-        return_value=({"results": []}, None),
-    ) as mock_invoke:
-        _, message, results_list, _ = handle_find_matches(profile)
-
-    mock_invoke.assert_called_once()
-    assert results_list == []
+def test_build_app_constructs():
+    app = main.build_app()
+    assert app is not None

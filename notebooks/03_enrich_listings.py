@@ -109,18 +109,30 @@ print(f"Record timeout:          {RECORD_TIMEOUT_SECONDS}s")
 # COMMAND ----------
 
 from pyspark.sql.functions import col, lower, monotonically_increasing_id, row_number, trim
+from pyspark.sql.functions import concat, lit
 from pyspark.sql.window import Window
 
 bronze_unenriched_df = spark.table(BRONZE_LISTINGS_TABLE).filter("enrichment_state = 'unenriched'")
 geocode_df = spark.table(GEOCODE_LOOKUP_TABLE)
 
+# The Jobsuche API returns location_text as a full address, e.g.
+# "10115, Berlin, Berlin", so an exact equality against a bare city name or
+# postal code almost never matches and virtually no listing gets coordinates
+# (leaving the map empty). Match instead when the geocode city_name or
+# postal_code appears as a substring of the (lowercased) location_text. This
+# geocodes every listing located in one of the known reference cities.
+_loc = lower(trim(col("b.location_text")))
+_city = lower(trim(col("g.city_name")))
+_plz = trim(col("g.postal_code"))
 joined_df = (
     bronze_unenriched_df.alias("b")
     .join(
         geocode_df.alias("g"),
         (
-            (lower(trim(col("b.location_text"))) == lower(trim(col("g.city_name"))))
-            | (lower(trim(col("b.location_text"))) == lower(trim(col("g.postal_code"))))
+            (_loc == _city)
+            | (_loc == lower(_plz))
+            | _loc.contains(_city)
+            | col("b.location_text").contains(_plz)
         ),
         how="left",
     )
@@ -149,6 +161,70 @@ joined_records = [row.asDict() for row in joined_df.collect()]
 
 print(f"Unenriched listings to process: {len(joined_records)}")
 
+# ---------------------------------------------------------------------------
+# Location fallback support
+# ---------------------------------------------------------------------------
+# Build an in-memory {lowercased city_name -> (lat, lon)} dict from the
+# geocode lookup so that when a listing has no coordinates from the SQL join,
+# we can resolve the city the LLM inferred (the `city` attribute) to
+# coordinates without another Spark join. Anything still unresolved falls back
+# to the geographic centre of Germany plus per-listing jitter, so EVERY
+# listing ends up with a location and appears on the map.
+from src.pipelines.attribute_normalization import (  # noqa: E402
+    bucket_benefits_rating,
+    bucket_company_size,
+    bucket_company_vibe,
+    bucket_employment_type,
+    bucket_industry,
+    bucket_office_policy,
+    bucket_seniority,
+    jitter_coord,
+    normalize_benefits_rating,
+    normalize_company_vibe,
+    normalize_office_policy,
+)
+
+_geo_rows = spark.table(GEOCODE_LOOKUP_TABLE).select("city_name", "latitude", "longitude").collect()
+CITY_TO_COORDS = {
+    (r["city_name"] or "").strip().lower(): (r["latitude"], r["longitude"])
+    for r in _geo_rows
+    if r["latitude"] is not None and r["longitude"] is not None
+}
+GERMANY_CENTER = (51.1657, 10.4515)
+
+
+def resolve_coordinates(record: dict, llm_result: dict, listing_id: str):
+    """Resolve (latitude, longitude) for a listing, guaranteeing a location.
+
+    Order of resolution:
+      1. Coordinates from the offline geocode join (record lat/lon).
+      2. The LLM-inferred `city` matched against the geocode lookup.
+      3. Any known city name found as a substring of location_text.
+      4. Germany centroid.
+    Steps 2-4 apply deterministic jitter (keyed on listing_id) so many
+    listings resolving to the same city/centroid spread into a visible cloud
+    rather than stacking on one marker.
+    """
+    lat, lon = record.get("latitude"), record.get("longitude")
+    if lat is not None and lon is not None:
+        return lat, lon
+
+    # 2. LLM-inferred city.
+    if isinstance(llm_result, dict):
+        city = (llm_result.get("city") or "").strip().lower()
+        if city and city != "unknown" and city in CITY_TO_COORDS:
+            base = CITY_TO_COORDS[city]
+            return jitter_coord(base[0], base[1], listing_id)
+
+    # 3. Known city as a substring of the raw location text.
+    loc = (record.get("location_text") or "").lower()
+    for city_name, base in CITY_TO_COORDS.items():
+        if city_name and city_name in loc:
+            return jitter_coord(base[0], base[1], listing_id)
+
+    # 4. Germany centroid fallback.
+    return jitter_coord(GERMANY_CENTER[0], GERMANY_CENTER[1], listing_id, amount_degrees=1.5)
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -173,8 +249,17 @@ LLM_EXTRACTION_PROMPT_TEMPLATE = (
     "Respond with ONLY a single JSON object and nothing else — no markdown "
     "code fences, no explanation. The object must have exactly these keys: "
     "required_skills (array of strings), seniority_level (string), "
-    "employment_type (string), industry (string), company_size_band (string). "
-    "Job description: {job_description}"
+    "employment_type (string), industry (string), company_size_band (string), "
+    "company_vibe (string: a 1-3 word culture descriptor, e.g. "
+    "'fast-paced startup', 'corporate', 'mission-driven'), "
+    "office_policy (string: exactly one of 'remote', 'hybrid', 'onsite', "
+    "or 'unknown'), "
+    "benefits_rating (string: exactly one of 'excellent', 'good', 'basic', "
+    "or 'unknown', judged from any perks/benefits mentioned), "
+    "city (string: the German city the job is located in; infer the most "
+    "likely major city if the text is vague, else 'unknown'). "
+    "For office_policy/benefits_rating/city, infer from the description; use "
+    "'unknown' only if there is truly no signal. Job description: {job_description}"
 )
 
 
@@ -253,7 +338,13 @@ def extract_attributes_via_ai_query(batch: list[dict]) -> dict[str, dict]:
                    'markdown code fences, no explanation. The object must have ',
                    'exactly these keys: required_skills (array of strings), ',
                    'seniority_level (string), employment_type (string), ',
-                   'industry (string), company_size_band (string). ',
+                   'industry (string), company_size_band (string), ',
+                   'company_vibe (string: a 1-3 word culture descriptor), ',
+                   'office_policy (string: one of remote, hybrid, onsite, unknown), ',
+                   'benefits_rating (string: one of excellent, good, basic, unknown), ',
+                   'city (string: the German city the job is in, or unknown). ',
+                   'For the last four, infer from the description; use unknown ',
+                   'only if there is truly no signal. ',
                    'Job description: ',
                    job_description
                  )
@@ -393,6 +484,20 @@ for target_table, schema in (
     if not spark.catalog.tableExists(target_table):
         spark.createDataFrame([], schema=schema).write.format("delta").saveAsTable(target_table)
 
+# Evolve a pre-existing enriched_listings table to include newly-introduced
+# columns (company_vibe, office_policy, benefits_rating) before the MERGE.
+# Serverless does not allow spark.databricks.delta.schema.autoMerge.enabled,
+# so add any missing columns explicitly via ALTER TABLE (idempotent — only
+# adds columns that are not already present).
+_existing_cols = {f.name for f in spark.table(SILVER_ENRICHED_TABLE).schema.fields}
+for _field in SILVER_ENRICHED_LISTINGS_SCHEMA.fields:
+    if _field.name not in _existing_cols:
+        spark.sql(
+            f"ALTER TABLE {SILVER_ENRICHED_TABLE} "
+            f"ADD COLUMNS ({_field.name} {_field.dataType.simpleString()})"
+        )
+        print(f"Added column {_field.name} to {SILVER_ENRICHED_TABLE}")
+
 silver_enriched_target = DeltaTable.forName(spark, SILVER_ENRICHED_TABLE)
 silver_chunks_target = DeltaTable.forName(spark, SILVER_CHUNKS_TABLE)
 bronze_target = DeltaTable.forName(spark, BRONZE_LISTINGS_TABLE)
@@ -417,8 +522,11 @@ for batch_index, batch in enumerate(batches):
 
     for record in batch:
         listing_id = record["listing_id"]
-        geocode_result = {"latitude": record.get("latitude"), "longitude": record.get("longitude")}
         llm_result = llm_results_by_id.get(listing_id, {"error": "no LLM result returned for listing"})
+
+        # Guarantee a location for every listing (join → LLM city → centroid).
+        resolved_lat, resolved_lon = resolve_coordinates(record, llm_result, listing_id)
+        geocode_result = {"latitude": resolved_lat, "longitude": resolved_lon}
 
         state, unresolved_attributes, failure_reason = determine_enrichment_state(geocode_result, llm_result)
         state_counts[state] += 1
@@ -426,6 +534,19 @@ for batch_index, batch in enumerate(batches):
         required_skills = llm_result.get("required_skills") if isinstance(llm_result, dict) else None
         required_skills = required_skills if isinstance(required_skills, list) else None
         required_skills_text = ", ".join(required_skills) if required_skills else ""
+
+        # Standardize the vibe attributes into fixed, lowercase buckets so the
+        # app filters show a small, clean set of values.
+        _raw = llm_result if isinstance(llm_result, dict) else {}
+        # Bucket every filterable attribute into 3-5 fixed emoji+text groups so
+        # the app dropdowns are short and readable.
+        b_seniority = bucket_seniority(_raw.get("seniority_level"))
+        b_employment = bucket_employment_type(_raw.get("employment_type"))
+        b_industry = bucket_industry(_raw.get("industry"))
+        b_company_size = bucket_company_size(_raw.get("company_size_band"))
+        norm_company_vibe = bucket_company_vibe(_raw.get("company_vibe"))
+        norm_office_policy = bucket_office_policy(_raw.get("office_policy"))
+        norm_benefits_rating = bucket_benefits_rating(_raw.get("benefits_rating"))
 
         embedding_text = build_embedding_text(
             record["job_title"], record.get("job_description") or "", required_skills_text
@@ -443,10 +564,13 @@ for batch_index, batch in enumerate(batches):
                 geocode_result["longitude"],
                 required_skills,
                 required_skills_text,
-                llm_result.get("seniority_level") if isinstance(llm_result, dict) else None,
-                llm_result.get("employment_type") if isinstance(llm_result, dict) else None,
-                llm_result.get("industry") if isinstance(llm_result, dict) else None,
-                llm_result.get("company_size_band") if isinstance(llm_result, dict) else None,
+                b_seniority,
+                b_employment,
+                b_industry,
+                b_company_size,
+                norm_company_vibe,
+                norm_office_policy,
+                norm_benefits_rating,
                 state,
                 unresolved_attributes if unresolved_attributes else None,
                 failure_reason,
@@ -490,7 +614,7 @@ for batch_index, batch in enumerate(batches):
     # subsequent run's `enrichment_state = 'unenriched'` filter (Req 3.1)
     # does not reprocess these listings.
     batch_states_df = spark.createDataFrame(
-        [(r[0], r[14]) for r in enriched_rows], ["listing_id", "enrichment_state"]
+        [(r[0], r[17]) for r in enriched_rows], ["listing_id", "enrichment_state"]
     )
     (
         bronze_target.alias("target")

@@ -22,6 +22,13 @@ bundle:
 include:
   - resources/*.yml
 
+# Reference datasets (geocode lookup, bundled fallback listings) are read by
+# the 00a_load_reference_data and 02_ingest notebooks from the synced bundle
+# files. They are not code, so ensure the sync explicitly includes them.
+sync:
+  include:
+    - data/**
+
 variables:
   catalog:
     description: Unity Catalog catalog used for all three-level names.
